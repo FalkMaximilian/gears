@@ -2,11 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use uuid::Uuid;
 
+use crate::context::WorkflowContext;
 use crate::error::{Result, ZdflowError};
-use crate::traits::{Activity, RunStatus, Storage, Workflow};
+use crate::metrics;
+use crate::traits::{Activity, RunFilter, RunInfo, RunStatus, Storage, Workflow};
 use crate::worker::WorkerTask;
 
 // ── Internal message types ────────────────────────────────────────────────
@@ -16,6 +18,9 @@ struct StartRequest {
     workflow_name: String,
     input: Value,
 }
+
+/// Shared map of active workflow contexts, used for cancellation.
+type CancelHandles = Arc<Mutex<HashMap<Uuid, WorkflowContext>>>;
 
 // ── WorkflowEngineBuilder ─────────────────────────────────────────────────
 
@@ -76,6 +81,7 @@ impl WorkflowEngineBuilder {
             start_tx,
             start_rx: Some(start_rx),
             max_concurrent: self.max_concurrent,
+            cancel_handles: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -90,6 +96,7 @@ pub struct WorkflowEngine {
     /// Held until `run()` is called and moves it into the dispatch task.
     start_rx: Option<mpsc::Receiver<StartRequest>>,
     max_concurrent: usize,
+    cancel_handles: CancelHandles,
 }
 
 impl WorkflowEngine {
@@ -127,6 +134,7 @@ impl WorkflowEngine {
         let workflows = self.workflows.clone();
         let activities = self.activities.clone();
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent));
+        let cancel_handles = self.cancel_handles.clone();
 
         tokio::spawn(dispatch_loop(
             start_rx,
@@ -135,6 +143,7 @@ impl WorkflowEngine {
             workflows,
             activities,
             semaphore,
+            cancel_handles,
         ));
 
         Ok(EngineHandle { shutdown_tx })
@@ -142,11 +151,7 @@ impl WorkflowEngine {
 
     /// Enqueue a new workflow run. Returns the run ID immediately;
     /// execution is asynchronous.
-    pub async fn start_workflow(
-        &self,
-        workflow_name: &str,
-        input: Value,
-    ) -> Result<Uuid> {
+    pub async fn start_workflow(&self, workflow_name: &str, input: Value) -> Result<Uuid> {
         if !self.workflows.contains_key(workflow_name) {
             return Err(ZdflowError::WorkflowNotFound(workflow_name.to_string()));
         }
@@ -166,12 +171,33 @@ impl WorkflowEngine {
             .map_err(|_| ZdflowError::EngineNotRunning)?;
 
         tracing::info!(run_id = %run_id, workflow = workflow_name, "workflow enqueued");
+        metrics::inc_workflow_started(workflow_name);
         Ok(run_id)
     }
 
     /// Poll the current status of a run.
     pub async fn get_run_status(&self, run_id: Uuid) -> Result<RunStatus> {
         self.storage.get_run_status(run_id).await
+    }
+
+    /// List runs matching the given filter criteria.
+    pub async fn list_runs(&self, filter: &RunFilter) -> Result<Vec<RunInfo>> {
+        self.storage.list_runs(filter).await
+    }
+
+    /// Cancel a running workflow. The workflow's context methods will
+    /// return `ZdflowError::Cancelled` at the next yield point.
+    pub async fn cancel_workflow(&self, run_id: Uuid) -> Result<()> {
+        let handles = self.cancel_handles.lock().await;
+        if let Some(ctx) = handles.get(&run_id) {
+            ctx.cancel();
+            tracing::info!(run_id = %run_id, "workflow cancellation requested");
+            Ok(())
+        } else {
+            Err(ZdflowError::Other(format!(
+                "no active workflow with run_id {run_id}"
+            )))
+        }
     }
 }
 
@@ -184,6 +210,7 @@ async fn dispatch_loop(
     workflows: Arc<HashMap<String, Arc<dyn Workflow>>>,
     activities: Arc<HashMap<String, Arc<dyn Activity>>>,
     semaphore: Arc<Semaphore>,
+    cancel_handles: CancelHandles,
 ) {
     loop {
         tokio::select! {
@@ -219,8 +246,9 @@ async fn dispatch_loop(
                     input: req.input,
                 };
 
+                let handles = cancel_handles.clone();
                 tokio::spawn(async move {
-                    task.run().await;
+                    task.run(&handles).await;
                     drop(permit);
                 });
             }

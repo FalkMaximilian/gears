@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::error::{Result, ZdflowError};
 use crate::event::{EventPayload, WorkflowEvent};
-use crate::traits::{RunRecord, RunStatus, Storage, StorageFuture};
+use crate::traits::{RunFilter, RunInfo, RunRecord, RunStatus, Storage, StorageFuture};
 
 /// SQLite-backed durable storage for workflow events and run state.
 ///
@@ -187,8 +187,8 @@ impl Storage for SqliteStorage {
 
             let mut result = Vec::with_capacity(rows.len());
             for (run_id_str, name, input_json) in rows {
-                let run_id = Uuid::parse_str(&run_id_str)
-                    .map_err(|e| ZdflowError::Other(e.to_string()))?;
+                let run_id =
+                    Uuid::parse_str(&run_id_str).map_err(|e| ZdflowError::Other(e.to_string()))?;
                 let input: Value = serde_json::from_str(&input_json)?;
                 result.push(RunRecord {
                     run_id,
@@ -212,6 +212,7 @@ impl Storage for SqliteStorage {
             RunStatus::Running => "running",
             RunStatus::Completed => "completed",
             RunStatus::Failed => "failed",
+            RunStatus::Cancelled => "cancelled",
             RunStatus::NotFound => "not_found",
         }
         .to_string();
@@ -243,8 +244,8 @@ impl Storage for SqliteStorage {
         Box::pin(async move {
             let status_opt: Option<String> = conn
                 .call(move |conn| {
-                    let mut stmt = conn
-                        .prepare("SELECT status FROM workflow_runs WHERE run_id = ?1")?;
+                    let mut stmt =
+                        conn.prepare("SELECT status FROM workflow_runs WHERE run_id = ?1")?;
                     let mut rows = stmt.query(rusqlite::params![run_id_str])?;
                     if let Some(row) = rows.next()? {
                         Ok(Some(row.get::<_, String>(0)?))
@@ -258,8 +259,112 @@ impl Storage for SqliteStorage {
                 Some("running") => RunStatus::Running,
                 Some("completed") => RunStatus::Completed,
                 Some("failed") => RunStatus::Failed,
+                Some("cancelled") => RunStatus::Cancelled,
                 _ => RunStatus::NotFound,
             })
+        })
+    }
+
+    fn list_runs(&self, filter: &RunFilter) -> StorageFuture<Vec<RunInfo>> {
+        let conn = self.conn.clone();
+
+        // Build filter parameters as owned values.
+        let status_str = filter.status.as_ref().map(|s| match s {
+            RunStatus::Running => "running".to_string(),
+            RunStatus::Completed => "completed".to_string(),
+            RunStatus::Failed => "failed".to_string(),
+            RunStatus::Cancelled => "cancelled".to_string(),
+            RunStatus::NotFound => "not_found".to_string(),
+        });
+        let workflow_name = filter.workflow_name.clone();
+        let created_after_ms = filter.created_after.map(|d| d.timestamp_millis());
+        let created_before_ms = filter.created_before.map(|d| d.timestamp_millis());
+        let limit = filter.limit;
+        let offset = filter.offset;
+
+        Box::pin(async move {
+            let rows: Vec<(String, String, String, i64, i64)> = conn
+                .call(move |conn| {
+                    let mut sql =
+                        "SELECT run_id, name, status, created_at, updated_at FROM workflow_runs WHERE 1=1"
+                            .to_string();
+                    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+                    if let Some(ref s) = status_str {
+                        params.push(Box::new(s.clone()));
+                        sql.push_str(&format!(" AND status = ?{}", params.len()));
+                    }
+                    if let Some(ref name) = workflow_name {
+                        params.push(Box::new(name.clone()));
+                        sql.push_str(&format!(" AND name = ?{}", params.len()));
+                    }
+                    if let Some(after) = created_after_ms {
+                        params.push(Box::new(after));
+                        sql.push_str(&format!(" AND created_at >= ?{}", params.len()));
+                    }
+                    if let Some(before) = created_before_ms {
+                        params.push(Box::new(before));
+                        sql.push_str(&format!(" AND created_at <= ?{}", params.len()));
+                    }
+
+                    sql.push_str(" ORDER BY created_at DESC");
+
+                    if let Some(limit) = limit {
+                        params.push(Box::new(limit as i64));
+                        sql.push_str(&format!(" LIMIT ?{}", params.len()));
+                    }
+                    if let Some(offset) = offset {
+                        params.push(Box::new(offset as i64));
+                        sql.push_str(&format!(" OFFSET ?{}", params.len()));
+                    }
+
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                        params.iter().map(|p| &**p).collect();
+
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows = stmt
+                        .query_map(param_refs.as_slice(), |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, i64>(4)?,
+                            ))
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    Ok(rows)
+                })
+                .await?;
+
+            let mut result = Vec::with_capacity(rows.len());
+            for (run_id_str, name, status_str, created_at_ms, updated_at_ms) in rows {
+                let run_id =
+                    Uuid::parse_str(&run_id_str).map_err(|e| ZdflowError::Other(e.to_string()))?;
+                let status = match status_str.as_str() {
+                    "running" => RunStatus::Running,
+                    "completed" => RunStatus::Completed,
+                    "failed" => RunStatus::Failed,
+                    "cancelled" => RunStatus::Cancelled,
+                    _ => RunStatus::NotFound,
+                };
+                let created_at = Utc
+                    .timestamp_millis_opt(created_at_ms)
+                    .single()
+                    .unwrap_or_else(Utc::now);
+                let updated_at = Utc
+                    .timestamp_millis_opt(updated_at_ms)
+                    .single()
+                    .unwrap_or_else(Utc::now);
+                result.push(RunInfo {
+                    run_id,
+                    workflow_name: name,
+                    status,
+                    created_at,
+                    updated_at,
+                });
+            }
+            Ok(result)
         })
     }
 }

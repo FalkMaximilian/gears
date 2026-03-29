@@ -43,10 +43,7 @@ pub enum EventPayload {
     },
 
     /// All retry attempts exhausted — workflow receives an error.
-    ActivityErrored {
-        sequence_id: u32,
-        error: String,
-    },
+    ActivityErrored { sequence_id: u32, error: String },
 
     /// Workflow called `ctx.sleep_until(wake_at)`.
     TimerStarted {
@@ -55,19 +52,26 @@ pub enum EventPayload {
     },
 
     /// Timer elapsed and workflow was resumed.
-    TimerFired {
+    TimerFired { sequence_id: u32 },
+
+    /// One attempt timed out before completing.
+    ActivityAttemptTimedOut {
         sequence_id: u32,
+        attempt: u32,
+        timeout_ms: u64,
     },
+
+    /// Version marker for safe workflow code migration.
+    VersionMarker { change_id: String, version: u32 },
+
+    /// Workflow was cancelled via `engine.cancel_workflow()`.
+    WorkflowCancelled { reason: String },
 
     /// Workflow function returned successfully.
-    WorkflowCompleted {
-        output: serde_json::Value,
-    },
+    WorkflowCompleted { output: serde_json::Value },
 
     /// Workflow function returned an error.
-    WorkflowFailed {
-        error: String,
-    },
+    WorkflowFailed { error: String },
 }
 
 #[cfg(test)]
@@ -117,6 +121,18 @@ mod tests {
             wake_at: Utc::now(),
         });
         round_trip(EventPayload::TimerFired { sequence_id: 1 });
+        round_trip(EventPayload::ActivityAttemptTimedOut {
+            sequence_id: 0,
+            attempt: 2,
+            timeout_ms: 5000,
+        });
+        round_trip(EventPayload::VersionMarker {
+            change_id: "add_step_2".into(),
+            version: 2,
+        });
+        round_trip(EventPayload::WorkflowCancelled {
+            reason: "user requested".into(),
+        });
         round_trip(EventPayload::WorkflowCompleted {
             output: json!({"done": true}),
         });

@@ -2,11 +2,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::Value;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::context::WorkflowContext;
-use crate::event::{EventPayload, WorkflowEvent};
+use crate::error::ZdflowError;
+use crate::event::EventPayload;
+use crate::metrics;
 use crate::traits::{Activity, RunStatus, Storage, Workflow};
+
+/// Shared map of active workflow contexts, used for cancellation.
+type CancelHandles = Arc<Mutex<HashMap<Uuid, WorkflowContext>>>;
 
 /// Executes a single workflow run from start (or recovery point) to finish.
 pub(crate) struct WorkerTask {
@@ -14,27 +20,24 @@ pub(crate) struct WorkerTask {
     pub workflow: Arc<dyn Workflow>,
     pub activities: Arc<HashMap<String, Arc<dyn Activity>>>,
     pub storage: Arc<dyn Storage>,
-    pub history: Vec<WorkflowEvent>,
+    pub history: Vec<crate::event::WorkflowEvent>,
     pub input: Value,
 }
 
 impl WorkerTask {
-    pub async fn run(self) {
+    pub async fn run(self, cancel_handles: &CancelHandles) {
         let run_id = self.run_id;
         tracing::info!(run_id = %run_id, workflow = self.workflow.name(), "workflow starting");
 
-        // Determine the next global event sequence.
-        // history is already loaded; WorkflowContext will track event_seq from max+1.
-
         // Record WorkflowStarted only if this is a brand-new run.
-        let is_new = !self.history.iter().any(|e| {
-            matches!(e.payload, EventPayload::WorkflowStarted { .. })
-        });
+        let is_new = !self
+            .history
+            .iter()
+            .any(|e| matches!(e.payload, EventPayload::WorkflowStarted { .. }));
 
         if is_new {
-            let seq = 0u64;
-            let event = WorkflowEvent {
-                sequence: seq,
+            let event = crate::event::WorkflowEvent {
+                sequence: 0u64,
                 occurred_at: chrono::Utc::now(),
                 payload: EventPayload::WorkflowStarted {
                     workflow_name: self.workflow.name().to_string(),
@@ -47,60 +50,69 @@ impl WorkerTask {
             }
         }
 
-        // Build a context that wraps the activity registry so workflow code
-        // can call `ctx.execute_activity`.
-        let ctx = WorkflowContextWithRegistry::new(
-            run_id,
-            self.history,
-            self.storage.clone(),
-            self.activities,
-        );
+        metrics::inc_workflow_active();
 
-        let result = self.workflow.run(ctx.inner_ctx(), self.input).await;
+        // Build the context with the activity registry.
+        let ctx = WorkflowContext::new(run_id, self.history, self.storage.clone(), self.activities);
 
-        match result {
+        // Register cancel handle so the engine can cancel this workflow.
+        {
+            let mut handles = cancel_handles.lock().await;
+            handles.insert(run_id, ctx.clone());
+        }
+
+        // Keep a clone for writing terminal events after the workflow returns.
+        let worker_ctx = ctx.clone();
+        let result = self.workflow.run(ctx, self.input).await;
+
+        let workflow_name = self.workflow.name();
+        match &result {
             Ok(output) => {
                 tracing::info!(run_id = %run_id, "workflow completed");
+                let _ = worker_ctx
+                    .append_event(EventPayload::WorkflowCompleted {
+                        output: output.clone(),
+                    })
+                    .await;
                 let _ = self
                     .storage
-                    .set_run_status(run_id, RunStatus::Completed, Some(output))
+                    .set_run_status(run_id, RunStatus::Completed, Some(output.clone()))
                     .await;
+                metrics::inc_workflow_completed(workflow_name);
+            }
+            Err(ZdflowError::Cancelled) => {
+                tracing::info!(run_id = %run_id, "workflow cancelled");
+                let _ = worker_ctx
+                    .append_event(EventPayload::WorkflowCancelled {
+                        reason: "cancelled via engine.cancel_workflow()".to_string(),
+                    })
+                    .await;
+                let _ = self
+                    .storage
+                    .set_run_status(run_id, RunStatus::Cancelled, None)
+                    .await;
+                metrics::inc_workflow_cancelled(workflow_name);
             }
             Err(e) => {
                 tracing::error!(run_id = %run_id, error = %e, "workflow failed");
+                let _ = worker_ctx
+                    .append_event(EventPayload::WorkflowFailed {
+                        error: e.to_string(),
+                    })
+                    .await;
                 let _ = self
                     .storage
                     .set_run_status(run_id, RunStatus::Failed, None)
                     .await;
+                metrics::inc_workflow_failed(workflow_name);
             }
         }
-    }
-}
+        metrics::dec_workflow_active();
 
-/// Thin wrapper that holds the activity registry alongside the context.
-/// The actual dispatch into activities happens inside `WorkflowContext::execute_activity`,
-/// which takes `&dyn Activity` — so the workflow code must pass the activity object.
-///
-/// For a simpler API, we provide a `WorkflowContextWithRegistry` that exposes
-/// a `WorkflowContext` already bound to the storage. The activities are passed
-/// directly by the user's workflow code, so no registry lookup is needed here.
-pub(crate) struct WorkflowContextWithRegistry {
-    ctx: WorkflowContext,
-}
-
-impl WorkflowContextWithRegistry {
-    fn new(
-        run_id: Uuid,
-        history: Vec<WorkflowEvent>,
-        storage: Arc<dyn Storage>,
-        _activities: Arc<HashMap<String, Arc<dyn Activity>>>,
-    ) -> Self {
-        WorkflowContextWithRegistry {
-            ctx: WorkflowContext::new(run_id, history, storage),
+        // Deregister cancel handle.
+        {
+            let mut handles = cancel_handles.lock().await;
+            handles.remove(&run_id);
         }
-    }
-
-    pub fn inner_ctx(&self) -> WorkflowContext {
-        self.ctx.clone()
     }
 }

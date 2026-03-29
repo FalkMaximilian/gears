@@ -24,6 +24,13 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+metrics = { version = "0.24", optional = true }
+
+[features]
+metrics = ["dep:metrics"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+
+[profile.release]
+lto = "fat"

@@ -8,20 +8,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::Json,
-    routing::post,
-    Router,
-};
+use axum::{Router, extract::State, http::StatusCode, response::Json, routing::post};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use zdflow::{
-    Activity, ActivityContext, ActivityFuture,
-    SqliteStorage, Workflow, WorkflowContext, WorkflowFuture,
-    WorkflowEngine,
+    Activity, ActivityContext, ActivityFuture, SqliteStorage, Workflow, WorkflowContext,
+    WorkflowEngine, WorkflowFuture,
 };
 
 // ── Activity: send a greeting ─────────────────────────────────────────────
@@ -57,9 +50,7 @@ impl Workflow for GreetingWorkflow {
     fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture {
         Box::pin(async move {
             // First greeting.
-            let result1 = ctx
-                .execute_activity(&SendGreetingActivity, input.clone())
-                .await?;
+            let result1 = ctx.execute_activity("send_greeting", input.clone()).await?;
             println!("[workflow] first greeting: {:?}", result1["message"]);
 
             // Durable sleep — if the process crashes here and restarts,
@@ -68,9 +59,7 @@ impl Workflow for GreetingWorkflow {
             println!("[workflow] woke up after sleep");
 
             // Second greeting.
-            let result2 = ctx
-                .execute_activity(&SendGreetingActivity, input.clone())
-                .await?;
+            let result2 = ctx.execute_activity("send_greeting", input.clone()).await?;
             println!("[workflow] second greeting: {:?}", result2["message"]);
 
             Ok(json!({
@@ -137,7 +126,9 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
     println!("Listening on http://localhost:3000");
-    println!("Try: curl -X POST http://localhost:3000/greet -H 'Content-Type: application/json' -d '{{\"name\": \"Alice\"}}'");
+    println!(
+        "Try: curl -X POST http://localhost:3000/greet -H 'Content-Type: application/json' -d '{{\"name\": \"Alice\"}}'"
+    );
 
     tokio::select! {
         result = axum::serve(listener, app) => { result?; }

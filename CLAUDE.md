@@ -25,13 +25,18 @@ engine.start_workflow(name, input)
   → persists WorkflowStarted event
   → spawns WorkerTask (bounded by semaphore for concurrency limit)
     → calls Workflow::run(WorkflowContext, input)
-      → ctx.execute_activity(activity, input)
+      → ctx.execute_activity("activity_name", input)
           → on replay: returns cached result from event history
-          → on new: persist ActivityScheduled → retry loop → persist ActivityCompleted/ActivityErrored
+          → on new: persist ActivityScheduled → retry loop (with optional timeout) → persist ActivityCompleted/ActivityErrored
+      → ctx.execute_activities_parallel(vec![("a", input), ("b", input)])
+          → pre-allocates sequence_ids → runs all branches concurrently → each branch replays independently
       → ctx.sleep(duration)
           → on replay: returns immediately if TimerFired in history
           → on new: persist TimerStarted → sleep → persist TimerFired
           → on crash-recovery: recalculate remaining time from TimerStarted timestamp
+      → ctx.get_version(change_id, min, max)
+          → on replay: returns stored version from VersionMarker event
+          → on new: persists max_version, returns it
   → persist WorkflowCompleted or WorkflowFailed + update run status
 ```
 
@@ -41,11 +46,12 @@ On engine startup, `list_running_workflows()` finds any in-progress runs and rep
 
 - **`traits.rs`** — `Workflow`, `Activity`, `Storage` traits. All user-defined logic implements these.
 - **`event.rs`** — `WorkflowEvent`/`EventPayload` enum — the immutable event log schema.
-- **`context.rs`** — `WorkflowContext` (passed to `Workflow::run`) provides `execute_activity()` and `sleep()`/`sleep_until()`. Maintains internal replay cache keyed by call sequence number.
-- **`engine.rs`** — `WorkflowEngineBuilder` + `WorkflowEngine`. Manages workflow registration, dispatch loop, recovery on startup, and concurrency via semaphore.
-- **`worker.rs`** — `WorkerTask` executes a single workflow run end-to-end.
+- **`context.rs`** — `WorkflowContext` (passed to `Workflow::run`) provides `execute_activity()`, `execute_activities_parallel()`, `sleep()`/`sleep_until()`, `get_version()`, and cancellation support. Maintains internal replay cache keyed by call sequence number. Activities are looked up by name from the registry.
+- **`engine.rs`** — `WorkflowEngineBuilder` + `WorkflowEngine`. Manages workflow/activity registration, dispatch loop, recovery on startup, concurrency via semaphore, `cancel_workflow()`, and `list_runs()`.
+- **`worker.rs`** — `WorkerTask` executes a single workflow run end-to-end. Writes `WorkflowCompleted`, `WorkflowFailed`, or `WorkflowCancelled` terminal events.
 - **`storage/sqlite.rs`** — SQLite backend (WAL mode). Two tables: `workflow_runs` (metadata + status) and `workflow_events` (append-only event log).
-- **`error.rs`** — `ZdflowError` enum covering storage, serialization, execution, and engine lifecycle errors.
+- **`metrics.rs`** — Optional metrics instrumentation behind the `metrics` Cargo feature.
+- **`error.rs`** — `ZdflowError` enum covering storage, serialization, execution, cancellation, and engine lifecycle errors.
 
 ### Deterministic Replay Invariant
 
@@ -53,4 +59,4 @@ Workflow functions must be **deterministic and side-effect free** — all I/O mu
 
 ### Activity Retries
 
-Activities retry with exponential backoff (default: 3 attempts, 1s base delay). Each failed attempt persists an `ActivityAttemptFailed` event. After all retries are exhausted, `ActivityErrored` is written and the error propagates to the workflow.
+Activities retry with exponential backoff (default: 3 attempts, 1s base delay). Each failed attempt persists an `ActivityAttemptFailed` event (or `ActivityAttemptTimedOut` if a timeout was configured). After all retries are exhausted, `ActivityErrored` is written and the error propagates to the workflow. Activities are referenced by name string, not by passing a trait object.

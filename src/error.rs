@@ -20,6 +20,9 @@ pub enum ZdflowError {
     #[error("workflow failed: {0}")]
     WorkflowFailed(String),
 
+    #[error("workflow cancelled")]
+    Cancelled,
+
     #[error("engine not running")]
     EngineNotRunning,
 

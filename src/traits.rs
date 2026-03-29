@@ -2,6 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -10,13 +11,10 @@ use crate::error::Result;
 use crate::event::WorkflowEvent;
 
 /// Boxed future returned by workflow and activity methods.
-pub type WorkflowFuture =
-    Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>;
-pub type ActivityFuture =
-    Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>;
+pub type WorkflowFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>;
+pub type ActivityFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>;
 /// Boxed future used by the dyn-compatible Storage trait.
-pub type StorageFuture<T> =
-    Pin<Box<dyn Future<Output = Result<T>> + Send + 'static>>;
+pub type StorageFuture<T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'static>>;
 
 // ── Workflow ──────────────────────────────────────────────────────────────
 
@@ -62,6 +60,13 @@ pub trait Activity: Send + Sync + 'static {
     fn retry_base_delay(&self) -> Duration {
         Duration::from_secs(1)
     }
+
+    /// Optional per-activity execution deadline. If the activity does not
+    /// complete within this duration, the attempt is treated as failed and
+    /// may be retried. Defaults to `None` (no timeout).
+    fn timeout(&self) -> Option<Duration> {
+        None
+    }
 }
 
 // ── Storage ───────────────────────────────────────────────────────────────
@@ -80,7 +85,29 @@ pub enum RunStatus {
     Running,
     Completed,
     Failed,
+    Cancelled,
     NotFound,
+}
+
+/// Filter criteria for listing workflow runs.
+#[derive(Debug, Clone, Default)]
+pub struct RunFilter {
+    pub status: Option<RunStatus>,
+    pub workflow_name: Option<String>,
+    pub created_after: Option<DateTime<Utc>>,
+    pub created_before: Option<DateTime<Utc>>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+/// Summary information about a workflow run.
+#[derive(Debug, Clone)]
+pub struct RunInfo {
+    pub run_id: Uuid,
+    pub workflow_name: String,
+    pub status: RunStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Persistence backend. Implement this trait to use a different database.
@@ -91,19 +118,10 @@ pub enum RunStatus {
 /// The default implementation is `SqliteStorage`.
 pub trait Storage: Send + Sync + 'static {
     /// Create a new run record before any events are appended.
-    fn create_run(
-        &self,
-        run_id: Uuid,
-        workflow_name: &str,
-        input: &Value,
-    ) -> StorageFuture<()>;
+    fn create_run(&self, run_id: Uuid, workflow_name: &str, input: &Value) -> StorageFuture<()>;
 
     /// Append a single event to the run's event log.
-    fn append_event(
-        &self,
-        run_id: Uuid,
-        event: &WorkflowEvent,
-    ) -> StorageFuture<()>;
+    fn append_event(&self, run_id: Uuid, event: &WorkflowEvent) -> StorageFuture<()>;
 
     /// Load the full ordered event history for a run.
     fn load_events(&self, run_id: Uuid) -> StorageFuture<Vec<WorkflowEvent>>;
@@ -122,4 +140,7 @@ pub trait Storage: Send + Sync + 'static {
 
     /// Query the status of a run.
     fn get_run_status(&self, run_id: Uuid) -> StorageFuture<RunStatus>;
+
+    /// List runs matching the given filter criteria.
+    fn list_runs(&self, filter: &RunFilter) -> StorageFuture<Vec<RunInfo>>;
 }

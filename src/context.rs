@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -8,7 +8,10 @@ use uuid::Uuid;
 
 use crate::error::{Result, ZdflowError};
 use crate::event::{EventPayload, WorkflowEvent};
+use crate::metrics;
 use crate::traits::{Activity, Storage};
+
+use std::collections::HashMap;
 
 // ── ActivityContext ───────────────────────────────────────────────────────
 
@@ -46,6 +49,11 @@ struct ContextInner {
     /// Global event sequence counter for the run (separate from call_counter).
     event_seq: AtomicU64,
     storage: Arc<dyn Storage>,
+    activities: Arc<HashMap<String, Arc<dyn Activity>>>,
+    /// Cancellation flag.
+    cancelled: AtomicBool,
+    /// Notified when the workflow is cancelled.
+    cancel_notify: tokio::sync::Notify,
 }
 
 impl WorkflowContext {
@@ -53,6 +61,7 @@ impl WorkflowContext {
         run_id: Uuid,
         history: Vec<WorkflowEvent>,
         storage: Arc<dyn Storage>,
+        activities: Arc<HashMap<String, Arc<dyn Activity>>>,
     ) -> Self {
         // Find the max sequence already in history so we assign new
         // event sequences after all existing ones.
@@ -64,6 +73,9 @@ impl WorkflowContext {
                 call_counter: AtomicU32::new(0),
                 event_seq: AtomicU64::new(max_seq + 1),
                 storage,
+                activities,
+                cancelled: AtomicBool::new(false),
+                cancel_notify: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -73,25 +85,59 @@ impl WorkflowContext {
         self.run_id
     }
 
+    /// Returns `true` if cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Request cancellation. Context methods will return
+    /// `ZdflowError::Cancelled` at the next yield point.
+    pub(crate) fn cancel(&self) {
+        self.inner.cancelled.store(true, Ordering::SeqCst);
+        self.inner.cancel_notify.notify_waiters();
+    }
+
+    fn check_cancelled(&self) -> Result<()> {
+        if self.is_cancelled() {
+            Err(ZdflowError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
     // ── execute_activity ─────────────────────────────────────────────────
 
-    /// Execute an activity, returning its output.
+    /// Execute an activity by name, returning its output.
     ///
-    /// If this `sequence_id` already has an `ActivityCompleted` event in
-    /// the history, the cached result is returned immediately without
-    /// calling the activity. This is the core replay mechanism.
-    ///
-    /// If no cached result exists, the activity is executed live with
-    /// automatic retry (up to `activity.max_attempts()` times).
-    pub async fn execute_activity(
+    /// The activity must have been registered on the engine builder via
+    /// `register_activity`. If this `sequence_id` already has an
+    /// `ActivityCompleted` event in the history, the cached result is
+    /// returned immediately (replay). Otherwise the activity is executed
+    /// live with automatic retry.
+    pub async fn execute_activity(&self, activity_name: &str, input: Value) -> Result<Value> {
+        let sequence_id = self.inner.call_counter.fetch_add(1, Ordering::SeqCst);
+
+        let activity = self
+            .inner
+            .activities
+            .get(activity_name)
+            .ok_or_else(|| ZdflowError::ActivityNotFound(activity_name.to_string()))?
+            .clone();
+
+        self.execute_activity_inner(&*activity, input, sequence_id)
+            .await
+    }
+
+    /// Core activity execution logic with an explicit sequence_id.
+    /// Used by both `execute_activity` (single) and
+    /// `execute_activities_parallel` (fan-out).
+    async fn execute_activity_inner(
         &self,
         activity: &dyn Activity,
         input: Value,
+        sequence_id: u32,
     ) -> Result<Value> {
-        let sequence_id = self
-            .inner
-            .call_counter
-            .fetch_add(1, Ordering::SeqCst);
+        self.check_cancelled()?;
 
         // ── Replay path ───────────────────────────────────────────────
         for event in &self.inner.history {
@@ -99,26 +145,24 @@ impl WorkflowContext {
                 sequence_id: sid,
                 output,
             } = &event.payload
+                && *sid == sequence_id
             {
-                if *sid == sequence_id {
-                    tracing::debug!(
-                        run_id = %self.run_id,
-                        activity = activity.name(),
-                        sequence_id,
-                        "replaying activity result from history"
-                    );
-                    return Ok(output.clone());
-                }
+                tracing::debug!(
+                    run_id = %self.run_id,
+                    activity = activity.name(),
+                    sequence_id,
+                    "replaying activity result from history"
+                );
+                return Ok(output.clone());
             }
             // If all retries previously exhausted, replay the error too.
             if let EventPayload::ActivityErrored {
                 sequence_id: sid,
                 error,
             } = &event.payload
+                && *sid == sequence_id
             {
-                if *sid == sequence_id {
-                    return Err(ZdflowError::ActivityFailed(error.clone()));
-                }
+                return Err(ZdflowError::ActivityFailed(error.clone()));
             }
         }
 
@@ -133,7 +177,10 @@ impl WorkflowContext {
 
         let max_attempts = activity.max_attempts();
         let base_delay = activity.retry_base_delay();
+        let timeout = activity.timeout();
         let mut last_error = String::new();
+        let activity_start = std::time::Instant::now();
+        metrics::inc_activity_started(activity.name());
 
         for attempt in 1..=max_attempts {
             let ctx = ActivityContext {
@@ -150,7 +197,49 @@ impl WorkflowContext {
                 "executing activity"
             );
 
-            match activity.execute(ctx, input.clone()).await {
+            let exec_future = activity.execute(ctx, input.clone());
+            let cancel_notify = &self.inner.cancel_notify;
+
+            let exec_result = match timeout {
+                Some(duration) => {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_notify.notified(), if !self.is_cancelled() => {
+                            return Err(ZdflowError::Cancelled);
+                        }
+                        result = tokio::time::timeout(duration, exec_future) => {
+                            match result {
+                                Ok(inner) => inner,
+                                Err(_elapsed) => {
+                                    let msg = format!(
+                                        "activity '{}' timed out after {:?}",
+                                        activity.name(),
+                                        duration
+                                    );
+                                    self.append_event(EventPayload::ActivityAttemptTimedOut {
+                                        sequence_id,
+                                        attempt,
+                                        timeout_ms: duration.as_millis() as u64,
+                                    })
+                                    .await?;
+                                    Err(ZdflowError::Other(msg))
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_notify.notified(), if !self.is_cancelled() => {
+                            return Err(ZdflowError::Cancelled);
+                        }
+                        result = exec_future => result,
+                    }
+                }
+            };
+
+            match exec_result {
                 Ok(output) => {
                     self.append_event(EventPayload::ActivityCompleted {
                         sequence_id,
@@ -161,6 +250,11 @@ impl WorkflowContext {
                         run_id = %self.run_id,
                         activity = activity.name(),
                         "activity completed"
+                    );
+                    metrics::inc_activity_completed(activity.name());
+                    metrics::record_activity_duration(
+                        activity.name(),
+                        activity_start.elapsed().as_secs_f64(),
                     );
                     return Ok(output);
                 }
@@ -181,6 +275,7 @@ impl WorkflowContext {
                     .await?;
 
                     if attempt < max_attempts {
+                        metrics::inc_activity_retries(activity.name());
                         let backoff = base_delay * 2u32.pow(attempt - 1);
                         tokio::time::sleep(backoff).await;
                     }
@@ -202,12 +297,52 @@ impl WorkflowContext {
         Err(ZdflowError::ActivityFailed(last_error))
     }
 
+    /// Execute multiple activities in parallel, returning results in the
+    /// same order as the input. Sequence IDs are pre-allocated to ensure
+    /// deterministic replay.
+    ///
+    /// If any activity fails, remaining in-flight activities are cancelled
+    /// and the first error is returned.
+    pub async fn execute_activities_parallel(
+        &self,
+        activities: Vec<(&str, Value)>,
+    ) -> Result<Vec<Value>> {
+        let n = activities.len() as u32;
+        let base = self.inner.call_counter.fetch_add(n, Ordering::SeqCst);
+
+        let mut handles = Vec::with_capacity(activities.len());
+        for (i, (activity_name, input)) in activities.into_iter().enumerate() {
+            let sequence_id = base + i as u32;
+            let activity = self
+                .inner
+                .activities
+                .get(activity_name)
+                .ok_or_else(|| ZdflowError::ActivityNotFound(activity_name.to_string()))?
+                .clone();
+            let ctx = self.clone();
+            handles.push(tokio::spawn(async move {
+                ctx.execute_activity_inner(&*activity, input, sequence_id)
+                    .await
+            }));
+        }
+
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let result = handle
+                .await
+                .map_err(|e| ZdflowError::Other(format!("task join error: {e}")))?;
+            results.push(result?);
+        }
+        Ok(results)
+    }
+
     // ── sleep / sleep_until ───────────────────────────────────────────────
 
     /// Durably suspend the workflow for at least `duration`.
     pub async fn sleep(&self, duration: Duration) -> Result<()> {
-        let wake_at = Utc::now() + chrono::Duration::from_std(duration)
-            .map_err(|e| ZdflowError::Other(e.to_string()))?;
+        let wake_at = Utc::now()
+            + chrono::Duration::from_std(duration)
+                .map_err(|e| ZdflowError::Other(e.to_string()))?;
         self.sleep_until(wake_at).await
     }
 
@@ -217,22 +352,21 @@ impl WorkflowContext {
     /// immediately. On crash-recovery (if `TimerStarted` exists but not
     /// `TimerFired`) the remaining duration is recalculated.
     pub async fn sleep_until(&self, wake_at: DateTime<Utc>) -> Result<()> {
-        let sequence_id = self
-            .inner
-            .call_counter
-            .fetch_add(1, Ordering::SeqCst);
+        self.check_cancelled()?;
+
+        let sequence_id = self.inner.call_counter.fetch_add(1, Ordering::SeqCst);
 
         // ── Replay: timer already fired ───────────────────────────────
         for event in &self.inner.history {
-            if let EventPayload::TimerFired { sequence_id: sid } = &event.payload {
-                if *sid == sequence_id {
-                    tracing::debug!(
-                        run_id = %self.run_id,
-                        sequence_id,
-                        "replaying timer from history"
-                    );
-                    return Ok(());
-                }
+            if let EventPayload::TimerFired { sequence_id: sid } = &event.payload
+                && *sid == sequence_id
+            {
+                tracing::debug!(
+                    run_id = %self.run_id,
+                    sequence_id,
+                    "replaying timer from history"
+                );
+                return Ok(());
             }
         }
 
@@ -243,13 +377,12 @@ impl WorkflowContext {
                 sequence_id: sid,
                 wake_at: recorded_wake_at,
             } = &event.payload
+                && *sid == sequence_id
             {
-                if *sid == sequence_id {
-                    // Use the originally-recorded wake_at, not the one
-                    // computed from `duration` (which would extend the sleep).
-                    effective_wake_at = *recorded_wake_at;
-                    break;
-                }
+                // Use the originally-recorded wake_at, not the one
+                // computed from `duration` (which would extend the sleep).
+                effective_wake_at = *recorded_wake_at;
+                break;
             }
         }
 
@@ -271,16 +404,20 @@ impl WorkflowContext {
         // Sleep for remaining duration (may be zero if already past).
         let now = Utc::now();
         if effective_wake_at > now {
-            let remaining = (effective_wake_at - now)
-                .to_std()
-                .unwrap_or(Duration::ZERO);
+            let remaining = (effective_wake_at - now).to_std().unwrap_or(Duration::ZERO);
             tracing::debug!(
                 run_id = %self.run_id,
                 sequence_id,
                 remaining_secs = remaining.as_secs_f64(),
                 "sleeping"
             );
-            tokio::time::sleep(remaining).await;
+            tokio::select! {
+                biased;
+                _ = self.inner.cancel_notify.notified(), if !self.is_cancelled() => {
+                    return Err(ZdflowError::Cancelled);
+                }
+                _ = tokio::time::sleep(remaining) => {}
+            }
         }
 
         self.append_event(EventPayload::TimerFired { sequence_id })
@@ -289,9 +426,55 @@ impl WorkflowContext {
         Ok(())
     }
 
+    // ── versioning ─────────────────────────────────────────────────────────
+
+    /// Return a version number for the given `change_id`, enabling safe
+    /// workflow code changes while runs are in-flight.
+    ///
+    /// On a fresh execution, `max_version` is stored and returned. On
+    /// replay, the previously stored version is returned. If the stored
+    /// version falls outside `[min_version, max_version]`, an error is
+    /// returned (the code has drifted too far from the persisted history).
+    ///
+    /// Unlike `execute_activity` and `sleep`, this does **not** consume a
+    /// sequence_id — the marker is keyed by `change_id` instead, so
+    /// inserting a version check does not shift other calls.
+    pub async fn get_version(
+        &self,
+        change_id: &str,
+        min_version: u32,
+        max_version: u32,
+    ) -> Result<u32> {
+        // Replay: look for an existing marker.
+        for event in &self.inner.history {
+            if let EventPayload::VersionMarker {
+                change_id: cid,
+                version,
+            } = &event.payload
+                && cid == change_id
+            {
+                if *version < min_version || *version > max_version {
+                    return Err(ZdflowError::Other(format!(
+                        "version incompatibility for '{}': stored={} range=[{}, {}]",
+                        change_id, version, min_version, max_version
+                    )));
+                }
+                return Ok(*version);
+            }
+        }
+
+        // New execution: persist max_version.
+        self.append_event(EventPayload::VersionMarker {
+            change_id: change_id.to_string(),
+            version: max_version,
+        })
+        .await?;
+        Ok(max_version)
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────
 
-    async fn append_event(&self, payload: EventPayload) -> Result<()> {
+    pub(crate) async fn append_event(&self, payload: EventPayload) -> Result<()> {
         let sequence = self.inner.event_seq.fetch_add(1, Ordering::SeqCst);
         let event = WorkflowEvent {
             sequence,
