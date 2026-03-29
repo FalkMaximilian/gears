@@ -52,6 +52,20 @@ flowchart TD
     L -- not in history --> O[Persist TimerStarted + sleep full duration]
 ```
 
+## Mental model
+
+Think of a workflow as a **recipe that remembers its own progress**. Each step — calling an external API, sending an email, waiting — is recorded in an append-only log before and after it runs. If the process crashes mid-recipe and restarts, the engine reads the log and knows exactly which steps finished, so it skips them and continues from where it left off.
+
+This is what "durable execution" means: the workflow function contains the business logic, and the event log is the source of truth about how far it got.
+
+Three rules follow from this model:
+
+1. **Workflow code must be deterministic.** The engine re-executes the function from the top on recovery, using the event log to supply results for already-completed steps. If the function makes different calls in a different order on the second run, the replay breaks. See [Determinism rules](#determinism-rules) for details.
+
+2. **All I/O belongs in activities.** Anything that can fail or has side effects (HTTP calls, database writes, sending email) must go through `ctx.execute_activity()`. Activity results are persisted, so they survive a crash and are returned from cache on replay.
+
+3. **Timers are durable.** `ctx.sleep()` stores the absolute wake time in the event log. On recovery, only the remaining duration is slept — the original full duration is not restarted.
+
 ## Core concepts
 
 ### Workflow
@@ -180,6 +194,59 @@ for run in &completed {
 
 `RunFilter` supports: `status`, `workflow_name`, `created_after`, `created_before`, `limit`, `offset`.
 
+## Determinism rules
+
+The workflow function will be executed **more than once**: on crash recovery, the engine re-runs it from the top, fast-forwarding through history. Each call to `execute_activity` or `sleep` is matched to history by its call position (a `sequence_id` counter that starts at 0 and increments with each call). If the function's call sequence differs between runs, the engine reads the wrong history entries and replay produces incorrect results.
+
+### What the engine requires
+
+The function must produce the **exact same sequence of `ctx` calls** every time it runs, given the same history. The actual data returned by those calls may vary (it is replayed from the log), but the number and order of calls must be fixed.
+
+### Do not do this inside a workflow function
+
+```rust
+// ❌ System time — different value on every execution
+let now = SystemTime::now();
+
+// ❌ Random values — different on every execution
+let id = rand::random::<u64>();
+
+// ❌ Direct I/O — will re-execute on replay, causing duplicate side effects
+let resp = reqwest::get("https://api.example.com/data").await?;
+
+// ❌ Environment variables or config that might change between runs
+let flag = std::env::var("FEATURE_FLAG").unwrap_or_default();
+
+// ❌ Spawning tasks or threads — not tracked by the replay mechanism
+tokio::spawn(async { /* ... */ });
+```
+
+### Wrap all non-determinism in activities instead
+
+```rust
+// ✅ Any I/O or non-determinism goes through execute_activity
+let data = ctx.execute_activity("fetch_data", json!({"url": "..."})).await?;
+
+// ✅ If you need the current time, fetch it as an activity so it's recorded
+let now_str = ctx.execute_activity("get_current_time", json!({})).await?;
+```
+
+### Branching on activity results is safe
+
+Branching on a result from `execute_activity` is fine — the result comes from the replay cache, so the same branch is taken on every replay:
+
+```rust
+let status = ctx.execute_activity("check_status", input).await?;
+if status["state"] == "pending" {
+    // Safe — this branch is always taken on replay because the cached result is "pending"
+    ctx.sleep(Duration::from_secs(60)).await?;
+}
+```
+
+### Adding or removing calls requires versioning
+
+If you deploy new code that inserts an `execute_activity` call before existing calls, every subsequent call shifts its `sequence_id` by one. In-flight workflows will then read the wrong history entries on replay. Use `ctx.get_version()` to gate new calls so existing runs follow the old path and new runs follow the new path. See [Versioning](#versioning) above.
+
 ## Event log
 
 Every state transition appends an immutable event. The full schema:
@@ -200,6 +267,35 @@ Every state transition appends an immutable event. The full schema:
 | `WorkflowCancelled` | Workflow was cancelled |
 
 Each event carries a monotonic `sequence` (global position in the run's log) and a `sequence_id` (logical call index, shared between activities and timers, used as the replay key).
+
+## Sequence IDs and the replay key
+
+Every call to `execute_activity` or `sleep` in a workflow is assigned a `sequence_id` from a counter that starts at 0 and increments with each call. This counter is the replay key: on recovery, the engine re-executes the function from the top, rebuilding the same counter, and each call looks up its result in history by `sequence_id`.
+
+```
+Call 0: execute_activity("send_email", ...)    → looks for ActivityCompleted { sequence_id: 0 }
+Call 1: sleep(60s)                              → looks for TimerFired        { sequence_id: 1 }
+Call 2: execute_activity("log_result", ...)    → looks for ActivityCompleted { sequence_id: 2 }
+```
+
+If all three events are in history, all three calls return instantly from cache and execution continues live from call 3 onwards.
+
+This is also why `sequence_id` is distinct from `sequence`: `sequence` is the global position of the event in the log (used for ordering), while `sequence_id` is the logical call index used as the lookup key during replay. Multiple events can share the same `sequence_id` — for example, `ActivityScheduled`, `ActivityAttemptFailed`, and `ActivityCompleted` all carry `sequence_id: 0` for the first activity call.
+
+### Parallel activities and ID pre-allocation
+
+`execute_activities_parallel` atomically pre-allocates `n` sequence IDs (one per branch) before spawning any tasks. This ensures that even though branches run concurrently, each has a deterministic, stable ID for replay regardless of which branch completes first.
+
+```
+execute_activities_parallel([("fetch_user", ...), ("fetch_orders", ...)])
+  → atomically increments counter by 2, allocating sequence_id 4 and 5
+  → spawns two concurrent tasks, each using its pre-allocated ID
+  → on replay: each branch independently replays from its own stable ID
+```
+
+### Version markers do not consume sequence IDs
+
+`get_version` is keyed by its `change_id` string, not by sequence position. This means inserting a `get_version` call anywhere in the workflow does not shift the sequence IDs of any surrounding `execute_activity` or `sleep` calls, making it safe to add version checks to workflows that have in-flight runs.
 
 ## Getting started
 
@@ -248,6 +344,69 @@ engine.cancel_workflow(run_id).await?;
 handle.shutdown().await;
 ```
 
+## Workflow run lifecycle
+
+Here is the exact sequence of operations for a single workflow run, from submission to completion.
+
+### 1. Submitting a run
+
+`engine.start_workflow("name", input)` does the following synchronously before returning:
+
+1. Validates that the workflow name is registered (returns `WorkflowNotFound` otherwise).
+2. Generates a new UUID `run_id`.
+3. Calls `storage.create_run(run_id, name, input)` — the run record is written to the database with status `Running`. **The run exists in the database at this point, even before any execution begins.**
+4. Sends a `StartRequest` over an internal `mpsc::channel(1024)` to the dispatch loop.
+5. Returns `run_id` to the caller immediately. The workflow has not started executing yet.
+
+### 2. Dispatch loop
+
+The dispatch loop runs as a background Tokio task started by `engine.run()`. For each `StartRequest`:
+
+1. Loads the full event history from storage (`load_events(run_id)`). For a brand-new run this is empty. For a recovered run this contains all previously persisted events.
+2. Acquires a permit from the concurrency semaphore. If `max_concurrent_workflows` permits are exhausted, this step blocks until a running workflow completes.
+3. Spawns a new Tokio task (`WorkerTask`) to execute the workflow. The semaphore permit is owned by the spawned task and dropped automatically when it finishes, freeing the slot.
+
+### 3. WorkerTask execution
+
+1. **New runs only**: if no `WorkflowStarted` event is in history, writes `WorkflowStarted { workflow_name, input }` to the log.
+2. Builds a `WorkflowContext` from the history, storage reference, and activity registry.
+3. Registers the context in a shared cancel-handle map keyed by `run_id`. This is what allows `engine.cancel_workflow(run_id)` to reach the live context.
+4. Calls `workflow.run(ctx, input)` and awaits the result.
+
+### 4. Inside WorkflowContext (per call)
+
+**`ctx.execute_activity("name", input)`**:
+- Atomically increments the call counter → `sequence_id`.
+- Scans history for `ActivityCompleted { sequence_id }` or `ActivityErrored { sequence_id }`.
+  - **Found in history (replay)**: returns the cached output or error immediately. No I/O occurs.
+  - **Not in history (live)**: persists `ActivityScheduled`, then runs the retry loop. Each failed attempt persists `ActivityAttemptFailed` or `ActivityAttemptTimedOut`. On success persists `ActivityCompleted`; on exhaustion persists `ActivityErrored`.
+
+**`ctx.sleep(duration)` / `ctx.sleep_until(wake_at)`**:
+- Atomically increments the call counter → `sequence_id`.
+- If `TimerFired { sequence_id }` is in history: returns immediately (full replay).
+- If `TimerStarted { sequence_id, wake_at }` is in history but not `TimerFired`: uses the **originally persisted** `wake_at` (not the value computed from the current `duration`), so the remaining duration is correct even if more time passed during the crash.
+- If neither: persists `TimerStarted { wake_at }`, sleeps the full duration, then persists `TimerFired`.
+
+### 5. Cancellation
+
+When `engine.cancel_workflow(run_id)` is called, it sets an atomic flag on the context and fires a `tokio::sync::Notify`. The workflow's next `execute_activity` or `sleep` call will see the flag and return `ZdflowError::Cancelled`. If the workflow is mid-activity, the `tokio::select!` inside the activity execution wakes on the notification and returns `Cancelled` immediately — the activity is interrupted rather than completing.
+
+### 6. WorkerTask completion
+
+After `workflow.run` returns, the terminal event is written and the run status is updated:
+
+| Result | Terminal event written | Final status |
+|---|---|---|
+| `Ok(output)` | `WorkflowCompleted { output }` | `Completed` |
+| `Err(ZdflowError::Cancelled)` | `WorkflowCancelled { reason }` | `Cancelled` |
+| `Err(other)` | `WorkflowFailed { error }` | `Failed` |
+
+The context is removed from the cancel-handle map and the semaphore permit is released.
+
+### What happens on process crash
+
+If the process dies at any point, the run's status remains `Running` in the database. On the next `engine.run()` call, `list_running_workflows()` finds all `Running` runs and re-dispatches them as `StartRequest`s. Each run replays through its history up to the last persisted event and then continues executing live.
+
 ## Metrics
 
 zdflow optionally records metrics via the [`metrics`](https://docs.rs/metrics) facade. Enable the `metrics` Cargo feature and install your own exporter (e.g. `metrics-exporter-prometheus`).
@@ -271,6 +430,48 @@ Emitted metrics:
 | `zdflow_activity_completed_total` | counter | Activity executions completed |
 | `zdflow_activity_retries_total` | counter | Activity retry attempts |
 | `zdflow_activity_duration_seconds` | histogram | Activity execution duration |
+
+## Error handling
+
+`ZdflowError` variants and when you will encounter them:
+
+| Variant | When it occurs | What to do |
+|---|---|---|
+| `ActivityFailed(msg)` | Activity exhausted all retry attempts. The message is from the last attempt. | Propagates as `Err(...)` to the workflow; handle or let the workflow fail. |
+| `ActivityNotFound(name)` | `ctx.execute_activity("name", ...)` called but no activity with that name is registered. | Fix the name string or register the activity. |
+| `WorkflowNotFound(name)` | `engine.start_workflow("name", ...)` called with an unregistered name. | Fix the name string or register the workflow. |
+| `Cancelled` | `engine.cancel_workflow(run_id)` was called and propagated to the context. | Returned from `execute_activity` or `sleep`; the `WorkerTask` writes `WorkflowCancelled`. |
+| `EngineNotRunning` | `start_workflow` or `cancel_workflow` called before `engine.run()` or after shutdown. | Ensure the engine is running before submitting work. |
+| `Storage(e)` | A SQLite operation failed (I/O error, constraint violation). | Check disk space and file permissions. |
+| `Serialize(e)` | JSON serialization or deserialization of an event payload failed. | Check that activity inputs/outputs are JSON-serializable. |
+| `Other(msg)` | Miscellaneous: timer duration overflow, version incompatibility, task join error. | Read the message for specifics. |
+
+**Activity errors are automatically retried** up to `max_attempts`. Only after all attempts are exhausted is `ActivityFailed` returned to the workflow.
+
+**Workflow errors are final.** If `Workflow::run` returns `Err`, the engine writes `WorkflowFailed` and marks the run as `Failed`. There is no automatic workflow-level retry. To retry at the workflow level, re-submit the workflow from your application code using a new `run_id`.
+
+**Panics leave the run stuck.** If `Workflow::run` panics, the Tokio task terminates without writing a terminal event and the run stays in `Running` status. On engine restart it is re-dispatched and replayed. Prefer `?` over `unwrap` in workflow code to propagate errors cleanly instead of panicking.
+
+## Logging
+
+zdflow uses [`tracing`](https://docs.rs/tracing) for structured logging. Set the `RUST_LOG` environment variable to control verbosity:
+
+```bash
+RUST_LOG=zdflow=debug cargo run   # verbose — logs every replay step, activity attempt, timer
+RUST_LOG=zdflow=info  cargo run   # normal  — workflow start/complete/fail, activity complete, recovery
+RUST_LOG=zdflow=warn  cargo run   # quiet   — only warnings and errors
+```
+
+Key events at each level:
+
+| Level | Events logged |
+|---|---|
+| `INFO` | Workflow enqueued, workflow starting, workflow completed / failed / cancelled, activity completed, crash recovery count |
+| `DEBUG` | Replaying activity result from history, replaying timer, executing activity (per attempt, with attempt number), sleeping (with remaining seconds) |
+| `WARN` | Activity attempt failed (with error message and attempt number) |
+| `ERROR` | Activity exhausted all retries, workflow failed (with error), failed to load history |
+
+Each log event includes `run_id` and relevant context (activity name, attempt number, sequence_id) as structured fields.
 
 ## Custom storage
 
@@ -365,7 +566,13 @@ There is no `ctx.start_child_workflow()` or `ctx.signal_workflow()`. Parent/chil
 On recovery, the workflow function runs from the beginning, fast-forwarding through history by returning cached results. For very long workflows with large histories, this replay can be slow. Snapshot/checkpoint support (saving the workflow's intermediate state) would mitigate this.
 
 ### No distributed execution
-All workers run in a single process. There is no worker-pool protocol, task queue, or distributed coordination layer. Scaling out requires building those on top.
+All workflow workers run as Tokio tasks within the same OS process as the engine. There is no mechanism to distribute work across separate machines, containers, or processes — all activity execution happens in-process via direct Rust function calls, not over a network protocol. This means:
+
+- You cannot run a pool of worker processes that pull tasks from a shared queue (as Temporal workers do).
+- Horizontal scaling (adding more machines) does not spread workflow load — only the single process holding the engine executes workflows.
+- Vertical scaling (adding CPU cores) does help within the concurrency limit set on `WorkflowEngineBuilder`, since workers are async tasks sharing the Tokio thread pool.
+
+Scaling out across multiple processes or hosts would require adding a distributed task-queue layer (e.g., having workers poll a shared database or message broker for work) and is out of scope for zdflow's current design.
 
 ## Future improvements
 
