@@ -12,10 +12,12 @@ use zdflow::{
 
 struct EchoActivity;
 
+impl EchoActivity {
+    pub const NAME: &'static str = "echo";
+}
+
 impl Activity for EchoActivity {
-    fn name(&self) -> &'static str {
-        "echo"
-    }
+    fn name(&self) -> &'static str { Self::NAME }
 
     fn execute(&self, _ctx: ActivityContext, input: Value) -> ActivityFuture {
         Box::pin(async move { Ok(input) })
@@ -24,10 +26,12 @@ impl Activity for EchoActivity {
 
 struct FailActivity;
 
+impl FailActivity {
+    pub const NAME: &'static str = "fail";
+}
+
 impl Activity for FailActivity {
-    fn name(&self) -> &'static str {
-        "fail"
-    }
+    fn name(&self) -> &'static str { Self::NAME }
 
     fn execute(&self, _ctx: ActivityContext, _input: Value) -> ActivityFuture {
         Box::pin(async move { Err(ZdflowError::Other("intentional failure".into())) })
@@ -40,10 +44,12 @@ impl Activity for FailActivity {
 
 struct SlowActivity;
 
+impl SlowActivity {
+    pub const NAME: &'static str = "slow";
+}
+
 impl Activity for SlowActivity {
-    fn name(&self) -> &'static str {
-        "slow"
-    }
+    fn name(&self) -> &'static str { Self::NAME }
 
     fn execute(&self, _ctx: ActivityContext, _input: Value) -> ActivityFuture {
         Box::pin(async move {
@@ -69,46 +75,54 @@ impl Activity for SlowActivity {
 
 struct SimpleWorkflow;
 
+impl SimpleWorkflow {
+    pub const NAME: &'static str = "simple";
+}
+
 impl Workflow for SimpleWorkflow {
-    fn name(&self) -> &'static str {
-        "simple"
-    }
+    fn name(&self) -> &'static str { Self::NAME }
 
     fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture {
-        Box::pin(async move { ctx.execute_activity("echo", input).await })
+        Box::pin(async move { ctx.execute_activity(EchoActivity::NAME, input).await })
     }
 }
 
 struct FailingWorkflow;
 
+impl FailingWorkflow {
+    pub const NAME: &'static str = "failing";
+}
+
 impl Workflow for FailingWorkflow {
-    fn name(&self) -> &'static str {
-        "failing"
-    }
+    fn name(&self) -> &'static str { Self::NAME }
 
     fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
-        Box::pin(async move { ctx.execute_activity("fail", json!({})).await })
+        Box::pin(async move { ctx.execute_activity(FailActivity::NAME, json!({})).await })
     }
 }
 
 struct TimeoutWorkflow;
 
+impl TimeoutWorkflow {
+    pub const NAME: &'static str = "timeout_wf";
+}
+
 impl Workflow for TimeoutWorkflow {
-    fn name(&self) -> &'static str {
-        "timeout_wf"
-    }
+    fn name(&self) -> &'static str { Self::NAME }
 
     fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
-        Box::pin(async move { ctx.execute_activity("slow", json!({})).await })
+        Box::pin(async move { ctx.execute_activity(SlowActivity::NAME, json!({})).await })
     }
 }
 
 struct SleepyWorkflow;
 
+impl SleepyWorkflow {
+    pub const NAME: &'static str = "sleepy";
+}
+
 impl Workflow for SleepyWorkflow {
-    fn name(&self) -> &'static str {
-        "sleepy"
-    }
+    fn name(&self) -> &'static str { Self::NAME }
 
     fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
         Box::pin(async move {
@@ -120,18 +134,20 @@ impl Workflow for SleepyWorkflow {
 
 struct ParallelWorkflow;
 
+impl ParallelWorkflow {
+    pub const NAME: &'static str = "parallel";
+}
+
 impl Workflow for ParallelWorkflow {
-    fn name(&self) -> &'static str {
-        "parallel"
-    }
+    fn name(&self) -> &'static str { Self::NAME }
 
     fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
         Box::pin(async move {
             let results = ctx
                 .execute_activities_parallel(vec![
-                    ("echo", json!({"id": 1})),
-                    ("echo", json!({"id": 2})),
-                    ("echo", json!({"id": 3})),
+                    (EchoActivity::NAME, json!({"id": 1})),
+                    (EchoActivity::NAME, json!({"id": 2})),
+                    (EchoActivity::NAME, json!({"id": 3})),
                 ])
                 .await?;
             Ok(json!(results))
@@ -141,18 +157,20 @@ impl Workflow for ParallelWorkflow {
 
 struct VersionedWorkflow;
 
+impl VersionedWorkflow {
+    pub const NAME: &'static str = "versioned";
+}
+
 impl Workflow for VersionedWorkflow {
-    fn name(&self) -> &'static str {
-        "versioned"
-    }
+    fn name(&self) -> &'static str { Self::NAME }
 
     fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
         Box::pin(async move {
             let version = ctx.get_version("add_step_2", 1, 2).await?;
             if version >= 2 {
-                let _ = ctx.execute_activity("echo", json!({"step": 2})).await?;
+                let _ = ctx.execute_activity(EchoActivity::NAME, json!({"step": 2})).await?;
             }
-            let result = ctx.execute_activity("echo", json!({"step": 1})).await?;
+            let result = ctx.execute_activity(EchoActivity::NAME, json!({"step": 1})).await?;
             Ok(json!({"version": version, "result": result}))
         })
     }

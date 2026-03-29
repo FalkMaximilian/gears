@@ -21,10 +21,12 @@ use zdflow::{
 
 struct SendGreetingActivity;
 
+impl SendGreetingActivity {
+    pub const NAME: &'static str = "send_greeting";
+}
+
 impl Activity for SendGreetingActivity {
-    fn name(&self) -> &'static str {
-        "send_greeting"
-    }
+    fn name(&self) -> &'static str { Self::NAME }
 
     fn execute(&self, ctx: ActivityContext, input: Value) -> ActivityFuture {
         Box::pin(async move {
@@ -42,15 +44,17 @@ impl Activity for SendGreetingActivity {
 
 struct GreetingWorkflow;
 
+impl GreetingWorkflow {
+    pub const NAME: &'static str = "greeting";
+}
+
 impl Workflow for GreetingWorkflow {
-    fn name(&self) -> &'static str {
-        "greeting"
-    }
+    fn name(&self) -> &'static str { Self::NAME }
 
     fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture {
         Box::pin(async move {
             // First greeting.
-            let result1 = ctx.execute_activity("send_greeting", input.clone()).await?;
+            let result1 = ctx.execute_activity(SendGreetingActivity::NAME, input.clone()).await?;
             println!("[workflow] first greeting: {:?}", result1["message"]);
 
             // Durable sleep — if the process crashes here and restarts,
@@ -59,7 +63,7 @@ impl Workflow for GreetingWorkflow {
             println!("[workflow] woke up after sleep");
 
             // Second greeting.
-            let result2 = ctx.execute_activity("send_greeting", input.clone()).await?;
+            let result2 = ctx.execute_activity(SendGreetingActivity::NAME, input.clone()).await?;
             println!("[workflow] second greeting: {:?}", result2["message"]);
 
             Ok(json!({
