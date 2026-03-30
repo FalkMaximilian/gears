@@ -5,7 +5,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::context::WorkflowContext;
+use crate::context::{ActivityContext, WorkflowContext};
 use crate::error::ZdflowError;
 use crate::event::EventPayload;
 use crate::metrics;
@@ -13,6 +13,150 @@ use crate::traits::{Activity, RunStatus, Storage, Workflow};
 
 /// Shared map of active workflow contexts, used for cancellation.
 type CancelHandles = Arc<Mutex<HashMap<Uuid, WorkflowContext>>>;
+
+/// Execute all registered cleanups that have not yet been completed or failed.
+///
+/// This function is called by [`WorkerTask::run`] immediately after
+/// `Workflow::run` returns `Ok` or `Err(ZdflowError::Cancelled)`. It is
+/// **not** called on `Err(other)` — workflow failures are left alone because
+/// they may be transient and recoverable.
+///
+/// ## Ordering
+///
+/// Cleanups are run in reverse registration order (LIFO). The assumption is
+/// that the last resource acquired should be the first released.
+///
+/// ## Failure tolerance
+///
+/// If a cleanup activity returns `Err`, or if the named activity is not in the
+/// registry, a [`EventPayload::CleanupFailed`] event is written and execution
+/// continues with the next cleanup. A failing cleanup never propagates an error
+/// or changes the workflow's final status.
+///
+/// ## Crash recovery / idempotency
+///
+/// This function runs **before** the terminal event is written. If the process
+/// crashes here, the run remains in `Running` status and will be re-dispatched
+/// on the next engine startup. To avoid running a cleanup twice, the function
+/// checks history for a [`EventPayload::CleanupCompleted`] or
+/// [`EventPayload::CleanupFailed`] event with a matching `sequence_id` before
+/// executing each cleanup. Cleanups that already have a terminal cleanup event
+/// are skipped.
+///
+/// ## Why events are reloaded from storage
+///
+/// The `WorkflowContext` was built with a history snapshot taken *before*
+/// `Workflow::run` was called. Any `CleanupRegistered` events appended during
+/// the live execution are not in that snapshot. Re-loading from storage here
+/// ensures all registrations — including those written moments ago — are
+/// visible.
+async fn run_cleanups(
+    run_id: Uuid,
+    storage: &Arc<dyn Storage>,
+    activities: &HashMap<String, Arc<dyn Activity>>,
+    worker_ctx: &WorkflowContext,
+) {
+    // Reload events from storage: cleanups registered during the live execution
+    // are not in the pre-loaded history snapshot that was passed to WorkflowContext.
+    let all_events = match storage.load_events(run_id).await {
+        Ok(events) => events,
+        Err(e) => {
+            tracing::error!(run_id = %run_id, error = %e, "failed to reload events for cleanup");
+            return;
+        }
+    };
+
+    // Collect CleanupRegistered entries in registration order, then reverse (LIFO).
+    let mut registrations: Vec<(u32, String, serde_json::Value)> = all_events
+        .iter()
+        .filter_map(|e| {
+            if let EventPayload::CleanupRegistered {
+                sequence_id,
+                activity_name,
+                input,
+            } = &e.payload
+            {
+                Some((*sequence_id, activity_name.clone(), input.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    registrations.reverse();
+
+    for (seq_id, activity_name, input) in registrations {
+        // Idempotency: skip cleanups that already have a terminal cleanup event.
+        // This handles crash recovery where some cleanups ran before the crash.
+        let already_done = all_events.iter().any(|e| {
+            matches!(&e.payload, EventPayload::CleanupCompleted { sequence_id: s } if *s == seq_id)
+                || matches!(&e.payload, EventPayload::CleanupFailed { sequence_id: s, .. } if *s == seq_id)
+        });
+        if already_done {
+            tracing::debug!(
+                run_id = %run_id,
+                sequence_id = seq_id,
+                activity = %activity_name,
+                "cleanup already executed, skipping"
+            );
+            continue;
+        }
+
+        let activity = match activities.get(&activity_name) {
+            Some(a) => a.clone(),
+            None => {
+                tracing::error!(
+                    run_id = %run_id,
+                    activity = %activity_name,
+                    "cleanup activity not found in registry"
+                );
+                let _ = worker_ctx
+                    .append_event(EventPayload::CleanupFailed {
+                        sequence_id: seq_id,
+                        error: format!("activity '{}' not registered", activity_name),
+                    })
+                    .await;
+                continue;
+            }
+        };
+
+        let cleanup_ctx = ActivityContext {
+            run_id,
+            activity_name: activity_name.clone(),
+            attempt: 1,
+            sequence_id: seq_id,
+        };
+
+        tracing::info!(
+            run_id = %run_id,
+            activity = %activity_name,
+            sequence_id = seq_id,
+            "running cleanup"
+        );
+
+        match activity.execute(cleanup_ctx, input).await {
+            Ok(_) => {
+                let _ = worker_ctx
+                    .append_event(EventPayload::CleanupCompleted { sequence_id: seq_id })
+                    .await;
+                tracing::info!(run_id = %run_id, activity = %activity_name, "cleanup completed");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    activity = %activity_name,
+                    error = %e,
+                    "cleanup failed (tolerated)"
+                );
+                let _ = worker_ctx
+                    .append_event(EventPayload::CleanupFailed {
+                        sequence_id: seq_id,
+                        error: e.to_string(),
+                    })
+                    .await;
+            }
+        }
+    }
+}
 
 /// Executes a single workflow run from start (or recovery point) to finish.
 pub(crate) struct WorkerTask {
@@ -53,7 +197,7 @@ impl WorkerTask {
         metrics::inc_workflow_active();
 
         // Build the context with the activity registry.
-        let ctx = WorkflowContext::new(run_id, self.history, self.storage.clone(), self.activities);
+        let ctx = WorkflowContext::new(run_id, self.history, self.storage.clone(), self.activities.clone());
 
         // Register cancel handle so the engine can cancel this workflow.
         {
@@ -68,7 +212,8 @@ impl WorkerTask {
         let workflow_name = self.workflow.name();
         match &result {
             Ok(output) => {
-                tracing::info!(run_id = %run_id, "workflow completed");
+                tracing::info!(run_id = %run_id, "workflow completed — running cleanups");
+                run_cleanups(run_id, &self.storage, &self.activities, &worker_ctx).await;
                 let _ = worker_ctx
                     .append_event(EventPayload::WorkflowCompleted {
                         output: output.clone(),
@@ -81,7 +226,8 @@ impl WorkerTask {
                 metrics::inc_workflow_completed(workflow_name);
             }
             Err(ZdflowError::Cancelled) => {
-                tracing::info!(run_id = %run_id, "workflow cancelled");
+                tracing::info!(run_id = %run_id, "workflow cancelled — running cleanups");
+                run_cleanups(run_id, &self.storage, &self.activities, &worker_ctx).await;
                 let _ = worker_ctx
                     .append_event(EventPayload::WorkflowCancelled {
                         reason: "cancelled via engine.cancel_workflow()".to_string(),

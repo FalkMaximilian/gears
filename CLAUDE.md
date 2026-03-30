@@ -37,7 +37,16 @@ engine.start_workflow(name, input)
       → ctx.get_version(change_id, min, max)
           → on replay: returns stored version from VersionMarker event
           → on new: persists max_version, returns it
-  → persist WorkflowCompleted or WorkflowFailed + update run status
+      → ctx.register_cleanup("activity_name", input)
+          → consumes a sequence_id from the same call counter as execute_activity/sleep
+          → on replay: finds CleanupRegistered{sequence_id} in history → no-op
+          → on new: persists CleanupRegistered event
+  → WorkerTask: if result is Ok or Cancelled → run_cleanups() in LIFO order
+      → for each CleanupRegistered not yet followed by CleanupCompleted/CleanupFailed:
+          → look up activity by name → call activity.execute() (single attempt)
+          → persist CleanupCompleted or CleanupFailed (failures tolerated, do not propagate)
+      → if result is Err(other) → skip cleanups entirely
+  → persist WorkflowCompleted/WorkflowCancelled (after cleanups) or WorkflowFailed + update run status
 ```
 
 On engine startup, `list_running_workflows()` finds any in-progress runs and replays them from their stored event history — this is the crash-recovery path.
@@ -46,9 +55,9 @@ On engine startup, `list_running_workflows()` finds any in-progress runs and rep
 
 - **`traits.rs`** — `Workflow`, `Activity`, `Storage` traits. All user-defined logic implements these.
 - **`event.rs`** — `WorkflowEvent`/`EventPayload` enum — the immutable event log schema.
-- **`context.rs`** — `WorkflowContext` (passed to `Workflow::run`) provides `execute_activity()`, `execute_activities_parallel()`, `sleep()`/`sleep_until()`, `get_version()`, and cancellation support. Maintains internal replay cache keyed by call sequence number. Activities are looked up by name from the registry.
+- **`context.rs`** — `WorkflowContext` (passed to `Workflow::run`) provides `execute_activity()`, `execute_activities_parallel()`, `sleep()`/`sleep_until()`, `get_version()`, `register_cleanup()`, and cancellation support. Maintains internal replay cache keyed by call sequence number. Activities are looked up by name from the registry.
 - **`engine.rs`** — `WorkflowEngineBuilder` + `WorkflowEngine`. Manages workflow/activity registration, dispatch loop, recovery on startup, concurrency via semaphore, `cancel_workflow()`, and `list_runs()`.
-- **`worker.rs`** — `WorkerTask` executes a single workflow run end-to-end. Writes `WorkflowCompleted`, `WorkflowFailed`, or `WorkflowCancelled` terminal events.
+- **`worker.rs`** — `WorkerTask` executes a single workflow run end-to-end. Runs registered cleanups (LIFO, failures tolerated) before writing `WorkflowCompleted` or `WorkflowCancelled`. Writes `WorkflowFailed` directly without cleanups.
 - **`storage/sqlite.rs`** — SQLite backend (WAL mode). Two tables: `workflow_runs` (metadata + status) and `workflow_events` (append-only event log).
 - **`metrics.rs`** — Optional metrics instrumentation behind the `metrics` Cargo feature.
 - **`error.rs`** — `ZdflowError` enum covering storage, serialization, execution, cancellation, and engine lifecycle errors.

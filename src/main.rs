@@ -80,6 +80,90 @@ impl Workflow for GreetingWorkflow {
     }
 }
 
+// ── Activity: allocate a resource ────────────────────────────────────────
+//
+// Simulates starting a long-running process on a third-party system
+// (e.g. a cloud VM or a batch job). Returns a handle that can be used
+// to cancel/release the resource.
+
+struct AllocateResourceActivity;
+
+impl AllocateResourceActivity {
+    pub const NAME: &'static str = "allocate_resource";
+}
+
+impl Activity for AllocateResourceActivity {
+    fn name(&self) -> &'static str { Self::NAME }
+
+    fn execute(&self, _ctx: ActivityContext, input: Value) -> ActivityFuture {
+        Box::pin(async move {
+            let resource = input["resource"].as_str().unwrap_or("unnamed");
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let handle = format!("handle-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+            println!("[activity] allocated resource '{}' → {}", resource, handle);
+            Ok(json!({ "resource": resource, "handle": handle }))
+        })
+    }
+}
+
+// ── Activity: release a resource (used as cleanup) ────────────────────────
+
+struct ReleaseResourceActivity;
+
+impl ReleaseResourceActivity {
+    pub const NAME: &'static str = "release_resource";
+}
+
+impl Activity for ReleaseResourceActivity {
+    fn name(&self) -> &'static str { Self::NAME }
+
+    fn execute(&self, _ctx: ActivityContext, input: Value) -> ActivityFuture {
+        Box::pin(async move {
+            let handle = input["handle"].as_str().unwrap_or("unknown");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            println!("[cleanup] released resource handle: {}", handle);
+            Ok(json!({ "released": handle }))
+        })
+    }
+}
+
+// ── Workflow: allocate resource with automatic cleanup ────────────────────
+//
+// Demonstrates ctx.register_cleanup: the release activity runs automatically
+// when the workflow completes successfully OR is cancelled.
+
+struct ResourceWorkflow;
+
+impl ResourceWorkflow {
+    pub const NAME: &'static str = "resource_workflow";
+}
+
+impl Workflow for ResourceWorkflow {
+    fn name(&self) -> &'static str { Self::NAME }
+
+    fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            // Allocate the resource.
+            let alloc =
+                ctx.execute_activity(AllocateResourceActivity::NAME, input.clone()).await?;
+
+            // Register cleanup immediately after allocation. This runs even if
+            // the workflow is cancelled during the sleep below.
+            ctx.register_cleanup(
+                ReleaseResourceActivity::NAME,
+                json!({ "handle": alloc["handle"] }),
+            )
+            .await?;
+
+            println!("[workflow] resource allocated, sleeping 3 s (try cancelling me)…");
+            ctx.sleep(Duration::from_secs(3)).await?;
+            println!("[workflow] work done");
+
+            Ok(json!({ "result": "done", "allocation": alloc }))
+        })
+    }
+}
+
 // ── Workflow: heartbeat (used by the cron schedule) ───────────────────────
 
 struct HeartbeatWorkflow;
@@ -109,6 +193,24 @@ struct GreetRequest {
 #[derive(Serialize)]
 struct GreetResponse {
     run_id: String,
+}
+
+async fn start_resource_workflow(
+    State(engine): State<Arc<WorkflowEngine>>,
+    Json(payload): Json<serde_json::Value>,
+) -> std::result::Result<Json<GreetResponse>, StatusCode> {
+    let resource = payload["resource"].as_str().unwrap_or("default-resource");
+    let run_id = engine
+        .start_workflow(ResourceWorkflow::NAME, json!({ "resource": resource }))
+        .await
+        .map_err(|e| {
+            tracing::error!("failed to start resource workflow: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(GreetResponse {
+        run_id: run_id.to_string(),
+    }))
 }
 
 async fn start_greeting(
@@ -198,7 +300,10 @@ async fn main() -> anyhow::Result<()> {
         .with_storage(storage)
         .register_workflow(GreetingWorkflow)
         .register_workflow(HeartbeatWorkflow)
+        .register_workflow(ResourceWorkflow)
         .register_activity(SendGreetingActivity)
+        .register_activity(AllocateResourceActivity)
+        .register_activity(ReleaseResourceActivity)
         .max_concurrent_workflows(50)
         .build()
         .await?;
@@ -220,6 +325,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/greet", post(start_greeting))
+        .route("/resource", post(start_resource_workflow))
         .route("/schedules", get(list_schedules_handler))
         .route("/schedules/{name}/pause", post(pause_schedule_handler))
         .route("/schedules/{name}/resume", post(resume_schedule_handler))
@@ -231,6 +337,9 @@ async fn main() -> anyhow::Result<()> {
         "Try: curl -X POST http://localhost:3000/greet -H 'Content-Type: application/json' -d '{{\"name\": \"Alice\"}}'"
     );
     println!("     curl http://localhost:3000/schedules");
+    println!(
+        "     curl -X POST http://localhost:3000/resource -H 'Content-Type: application/json' -d '{{\"resource\": \"my-vm\"}}'"
+    );
 
     tokio::select! {
         result = axum::serve(listener, app) => { result?; }

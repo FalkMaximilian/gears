@@ -64,6 +64,41 @@ pub enum EventPayload {
     /// Version marker for safe workflow code migration.
     VersionMarker { change_id: String, version: u32 },
 
+    /// The workflow called `ctx.register_cleanup()`, registering an activity to
+    /// be executed when the workflow completes successfully or is cancelled.
+    ///
+    /// `sequence_id` is allocated from the same call counter as
+    /// `execute_activity` and `sleep`, so this event participates in
+    /// deterministic replay: on recovery, the matching event in history is
+    /// found and the call returns immediately without re-persisting.
+    ///
+    /// Multiple `CleanupRegistered` events may appear in a single run's log.
+    /// The `WorkerTask` runs them in reverse registration order (LIFO) before
+    /// writing the terminal event.
+    CleanupRegistered {
+        sequence_id: u32,
+        activity_name: String,
+        input: serde_json::Value,
+    },
+
+    /// A registered cleanup activity ran and returned `Ok`.
+    ///
+    /// Written by `WorkerTask` after calling the cleanup activity. The
+    /// `sequence_id` matches the corresponding `CleanupRegistered` event.
+    /// On crash recovery, the presence of this event means the cleanup has
+    /// already been executed and will be skipped.
+    CleanupCompleted { sequence_id: u32 },
+
+    /// A registered cleanup activity ran and returned `Err`, or the named
+    /// activity was not in the registry.
+    ///
+    /// Cleanup failures are **tolerated**: this event is written and execution
+    /// continues with the next cleanup. The workflow's terminal status
+    /// (`Completed` or `Cancelled`) is not affected. As with `CleanupCompleted`,
+    /// the presence of this event prevents the cleanup from being re-run on
+    /// crash recovery.
+    CleanupFailed { sequence_id: u32, error: String },
+
     /// Workflow was cancelled via `engine.cancel_workflow()`.
     WorkflowCancelled { reason: String },
 
@@ -138,6 +173,16 @@ mod tests {
         });
         round_trip(EventPayload::WorkflowFailed {
             error: "oops".into(),
+        });
+        round_trip(EventPayload::CleanupRegistered {
+            sequence_id: 5,
+            activity_name: "release_resource".into(),
+            input: json!({"handle": "h-123"}),
+        });
+        round_trip(EventPayload::CleanupCompleted { sequence_id: 5 });
+        round_trip(EventPayload::CleanupFailed {
+            sequence_id: 5,
+            error: "file not found".into(),
         });
     }
 }

@@ -227,6 +227,130 @@ Examples:
 - Paused schedules skip missed fires. On `resume_schedule`, the next future cron slot is used.
 - Overlapping runs are allowed by default: if a workflow run is still in-progress when the next tick fires, a new run is started in parallel.
 
+### Cleanup / Finalizers
+
+`ctx.register_cleanup(activity_name, input)` schedules an activity to run when the workflow ends. It is the primary way to release external resources (terminate processes, delete temporary files, cancel API jobs) in a durable, crash-safe way.
+
+```rust
+fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture {
+    Box::pin(async move {
+        // Start an external process.
+        let job = ctx.execute_activity("start_job", input).await?;
+
+        // Register cleanup immediately after acquiring the resource.
+        // If this workflow is cancelled or completes, "cancel_job" will
+        // always be called — even across process crashes.
+        ctx.register_cleanup("cancel_job", json!({ "job_id": job["id"] })).await?;
+
+        // Do the actual work. If this sleep is interrupted by cancellation,
+        // the cleanup still runs before the WorkflowCancelled event is written.
+        ctx.sleep(Duration::from_secs(3600)).await?;
+
+        Ok(json!({ "result": "done" }))
+    })
+}
+```
+
+The cleanup activity is an ordinary `Activity` implementation — no new trait is required.
+
+```rust
+struct CancelJobActivity;
+
+impl Activity for CancelJobActivity {
+    fn name(&self) -> &'static str { "cancel_job" }
+
+    fn execute(&self, _ctx: ActivityContext, input: Value) -> ActivityFuture {
+        Box::pin(async move {
+            let id = input["job_id"].as_str().unwrap_or("?");
+            // Best-effort cancellation of the external job.
+            cancel_remote_job(id).await?;
+            Ok(json!(null))
+        })
+    }
+}
+```
+
+#### When cleanups run
+
+| Workflow outcome | Cleanups run? |
+|---|---|
+| Returned `Ok` — completed successfully | **Yes** |
+| Cancelled via `engine.cancel_workflow` | **Yes** |
+| Returned `Err` — workflow failed | **No** |
+
+Failures are excluded because they may be transient (e.g. the external API was temporarily unavailable, or a dependency timed out). Cleanup code typically cancels or releases resources that were intentionally acquired, which is only meaningful when the workflow reached a terminal state on purpose.
+
+#### Ordering
+
+Multiple cleanups can be registered in a single workflow. They run in **reverse registration order** (LIFO), mirroring the typical resource ownership relationship: the last resource acquired should be the first released.
+
+```rust
+ctx.register_cleanup("release_lock",    json!({ "lock": lock_id })).await?;
+// ... acquire more resources ...
+ctx.register_cleanup("delete_temp_file", json!({ "path": tmp_path })).await?;
+ctx.register_cleanup("terminate_vm",    json!({ "id": vm_id })).await?;
+
+// Cleanup order when the workflow ends:
+//   1. terminate_vm       (registered last → runs first)
+//   2. delete_temp_file
+//   3. release_lock       (registered first → runs last)
+```
+
+#### Failure tolerance
+
+Cleanup activities are **allowed to fail**. If a cleanup returns `Err`, or if the named activity is not in the engine's registry, a `CleanupFailed` event is written to the log and execution continues with the next registered cleanup. The workflow's final status (`Completed` or `Cancelled`) is not affected.
+
+This is intentional: cleanup failures often indicate the resource was already gone (file already deleted, job already terminated). The failure is preserved in the event log so it can be surfaced in a monitoring dashboard.
+
+#### Crash safety
+
+Cleanups run *before* the terminal event (`WorkflowCompleted` or `WorkflowCancelled`) is written. If the process crashes mid-cleanup, the run stays in `Running` status and is re-dispatched on the next engine startup. The engine checks the event log for a `CleanupCompleted` or `CleanupFailed` event for each registered cleanup and skips any that already have one. Only the remaining cleanups are re-executed.
+
+```
+Registered cleanups: [A (seq 3), B (seq 4), C (seq 5)]
+Crash happens after B completes but before C starts.
+
+Event log contains:
+  CleanupRegistered(seq=3)
+  CleanupRegistered(seq=4)
+  CleanupRegistered(seq=5)
+  CleanupCompleted(seq=5)   ← B completed (LIFO, so B = seq 5)
+  CleanupCompleted(seq=4)   ← C already done too, hypothetically
+
+On recovery:
+  seq=5 → already has CleanupCompleted → skip
+  seq=4 → already has CleanupCompleted → skip
+  seq=3 → no terminal cleanup event → run A
+  Write WorkflowCompleted.
+```
+
+#### Replay
+
+`register_cleanup` participates in the same deterministic replay system as `execute_activity` and `sleep`. It consumes a `sequence_id` from the call counter. On replay, the matching `CleanupRegistered` event is found in history at that counter position and the call returns immediately — the counter advances normally, keeping all subsequent calls aligned.
+
+```
+Call 0: execute_activity("start_job", ...)  → sequence_id 0
+Call 1: register_cleanup("cancel_job", ...) → sequence_id 1  ← replay: found CleanupRegistered{seq=1}
+Call 2: sleep(3600s)                         → sequence_id 2
+```
+
+#### Demo
+
+The demo server includes a `ResourceWorkflow` that illustrates cleanup in practice:
+
+```bash
+# Start the workflow — it sleeps 3 seconds then completes, running cleanup at the end.
+curl -X POST http://localhost:3000/resource \
+     -H 'Content-Type: application/json' \
+     -d '{"resource": "my-vm"}'
+# {"run_id": "<uuid>"}
+
+# To observe cleanup on cancellation, cancel immediately after starting:
+# engine.cancel_workflow(run_id) via your application code
+```
+
+Watch the server logs. You will see `[cleanup] released resource handle: ...` printed before the workflow's terminal status is recorded.
+
 ### Run listing and search
 
 `engine.list_runs()` returns workflow runs matching a filter:
@@ -314,23 +438,27 @@ Every state transition appends an immutable event. The full schema:
 | `TimerStarted` | When `ctx.sleep*` is first called |
 | `TimerFired` | After the sleep elapses |
 | `VersionMarker` | When `ctx.get_version()` records a version |
-| `WorkflowCompleted` | Workflow returned `Ok` |
-| `WorkflowFailed` | Workflow returned `Err` |
-| `WorkflowCancelled` | Workflow was cancelled |
+| `CleanupRegistered` | When `ctx.register_cleanup()` is called |
+| `CleanupCompleted` | A cleanup activity returned `Ok` |
+| `CleanupFailed` | A cleanup activity returned `Err` or was not registered |
+| `WorkflowCompleted` | Written after all cleanups finish; workflow returned `Ok` |
+| `WorkflowFailed` | Workflow returned `Err` (cleanups do not run) |
+| `WorkflowCancelled` | Written after all cleanups finish; workflow was cancelled |
 
 Each event carries a monotonic `sequence` (global position in the run's log) and a `sequence_id` (logical call index, shared between activities and timers, used as the replay key).
 
 ## Sequence IDs and the replay key
 
-Every call to `execute_activity` or `sleep` in a workflow is assigned a `sequence_id` from a counter that starts at 0 and increments with each call. This counter is the replay key: on recovery, the engine re-executes the function from the top, rebuilding the same counter, and each call looks up its result in history by `sequence_id`.
+Every call to `execute_activity`, `sleep`, or `register_cleanup` in a workflow is assigned a `sequence_id` from a counter that starts at 0 and increments with each call. This counter is the replay key: on recovery, the engine re-executes the function from the top, rebuilding the same counter, and each call looks up its result in history by `sequence_id`.
 
 ```
-Call 0: execute_activity("send_email", ...)    → looks for ActivityCompleted { sequence_id: 0 }
-Call 1: sleep(60s)                              → looks for TimerFired        { sequence_id: 1 }
-Call 2: execute_activity("log_result", ...)    → looks for ActivityCompleted { sequence_id: 2 }
+Call 0: execute_activity("send_email", ...)    → looks for ActivityCompleted  { sequence_id: 0 }
+Call 1: register_cleanup("cleanup_email", ...) → looks for CleanupRegistered  { sequence_id: 1 }
+Call 2: sleep(60s)                              → looks for TimerFired         { sequence_id: 2 }
+Call 3: execute_activity("log_result", ...)    → looks for ActivityCompleted  { sequence_id: 3 }
 ```
 
-If all three events are in history, all three calls return instantly from cache and execution continues live from call 3 onwards.
+If all four events are in history, all four calls return instantly from cache and execution continues live from call 4 onwards.
 
 This is also why `sequence_id` is distinct from `sequence`: `sequence` is the global position of the event in the log (used for ordering), while `sequence_id` is the logical call index used as the lookup key during replay. Multiple events can share the same `sequence_id` — for example, `ActivityScheduled`, `ActivityAttemptFailed`, and `ActivityCompleted` all carry `sequence_id: 0` for the first activity call.
 
@@ -445,13 +573,15 @@ When `engine.cancel_workflow(run_id)` is called, it sets an atomic flag on the c
 
 ### 6. WorkerTask completion
 
-After `workflow.run` returns, the terminal event is written and the run status is updated:
+After `workflow.run` returns, registered cleanups are executed (where applicable) and then the terminal event is written and the run status is updated:
 
-| Result | Terminal event written | Final status |
-|---|---|---|
-| `Ok(output)` | `WorkflowCompleted { output }` | `Completed` |
-| `Err(ZdflowError::Cancelled)` | `WorkflowCancelled { reason }` | `Cancelled` |
-| `Err(other)` | `WorkflowFailed { error }` | `Failed` |
+| Result | Cleanups run? | Terminal event written | Final status |
+|---|---|---|---|
+| `Ok(output)` | **Yes** | `WorkflowCompleted { output }` | `Completed` |
+| `Err(ZdflowError::Cancelled)` | **Yes** | `WorkflowCancelled { reason }` | `Cancelled` |
+| `Err(other)` | No | `WorkflowFailed { error }` | `Failed` |
+
+Cleanups run in LIFO order. Each cleanup writes a `CleanupCompleted` or `CleanupFailed` event; failures do not abort remaining cleanups or change the final status. The terminal event is only written after all cleanups have finished (or been skipped).
 
 The context is removed from the cancel-handle map and the semaphore permit is released.
 
@@ -603,6 +733,7 @@ The dispatch loop holds a `Semaphore` to bound concurrent workflow executions. E
 - **Versioning** — `ctx.get_version(change_id, min, max)` for safe workflow code changes with in-flight runs
 - **Crash recovery** — in-flight workflows detected and resumed on engine startup
 - **Workflow cancellation** — `engine.cancel_workflow(run_id)` cooperatively stops a running workflow
+- **Cleanup / Finalizers** — `ctx.register_cleanup(activity_name, input)` schedules cleanup activities that run on workflow success or cancellation (not failure); LIFO order; failures tolerated and recorded; crash-safe via `CleanupCompleted`/`CleanupFailed` events
 - **Run listing and search** — `engine.list_runs(filter)` with status, name, date range, and pagination
 - **Pluggable storage** — `Storage` trait; SQLite provided out of the box (WAL mode, bundled)
 - **Concurrency limit** — semaphore-based cap on simultaneous workflow executions

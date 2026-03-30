@@ -472,6 +472,94 @@ impl WorkflowContext {
         Ok(max_version)
     }
 
+    // ── cleanup ───────────────────────────────────────────────────────────
+
+    /// Register an activity to be executed as a cleanup (finalizer) for this
+    /// workflow run.
+    ///
+    /// # When cleanups run
+    ///
+    /// Cleanups are executed by the `WorkerTask` after `Workflow::run` returns,
+    /// **before** the terminal event is written to the log:
+    ///
+    /// | Workflow outcome | Cleanups run? |
+    /// |---|---|
+    /// | `Ok(output)` — completed successfully | **Yes** |
+    /// | `Err(ZdflowError::Cancelled)` — cancelled | **Yes** |
+    /// | `Err(other)` — failed | **No** |
+    ///
+    /// Workflow failures are excluded because they may be transient (e.g. an
+    /// external API was temporarily unavailable). Cleanup code typically frees
+    /// or cancels resources that were intentionally acquired, which is only
+    /// appropriate when the workflow reached a terminal state on purpose.
+    ///
+    /// # Ordering
+    ///
+    /// Cleanups run in **reverse registration order** (LIFO), like a stack of
+    /// deferred functions. This mirrors the typical resource ownership
+    /// relationship: the last resource acquired should be the first released.
+    ///
+    /// # Failure tolerance
+    ///
+    /// A cleanup is allowed to fail. If the cleanup activity returns `Err`,
+    /// or if the named activity is not in the registry, a `CleanupFailed` event
+    /// is written to the log and execution continues with the next cleanup. The
+    /// workflow's final status (`Completed` or `Cancelled`) is not affected.
+    ///
+    /// # Crash safety
+    ///
+    /// Because cleanups are run before the terminal event, a crash during
+    /// cleanup leaves the run in `Running` status. On the next engine restart,
+    /// the run is recovered and replayed. Cleanups that have already written a
+    /// `CleanupCompleted` or `CleanupFailed` event are skipped; only the
+    /// remaining ones are re-executed.
+    ///
+    /// # Replay
+    ///
+    /// `register_cleanup` consumes a `sequence_id` from the same call counter
+    /// as `execute_activity` and `sleep`. On replay, the matching
+    /// `CleanupRegistered` event is found in history at that counter position
+    /// and this method returns immediately without re-persisting the event.
+    /// The counter advances normally, keeping all subsequent calls aligned.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Allocate an external resource.
+    /// let alloc = ctx.execute_activity("allocate_vm", input.clone()).await?;
+    ///
+    /// // Register cleanup immediately — runs even if the workflow is cancelled
+    /// // or completes successfully.
+    /// ctx.register_cleanup("terminate_vm", json!({ "id": alloc["vm_id"] })).await?;
+    ///
+    /// // Continue with the rest of the workflow. If this sleep is interrupted
+    /// // by a cancellation, "terminate_vm" will still be called.
+    /// ctx.sleep(Duration::from_secs(300)).await?;
+    /// ```
+    pub async fn register_cleanup(&self, activity_name: &str, input: Value) -> Result<()> {
+        let sequence_id = self.inner.call_counter.fetch_add(1, Ordering::SeqCst);
+
+        // Replay path: if CleanupRegistered at this sequence_id is already in
+        // history, return without persisting again.
+        for event in &self.inner.history {
+            if let EventPayload::CleanupRegistered {
+                sequence_id: sid, ..
+            } = &event.payload
+                && *sid == sequence_id
+            {
+                return Ok(());
+            }
+        }
+
+        // Live path: persist the registration.
+        self.append_event(EventPayload::CleanupRegistered {
+            sequence_id,
+            activity_name: activity_name.to_string(),
+            input,
+        })
+        .await
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────
 
     pub(crate) async fn append_event(&self, payload: EventPayload) -> Result<()> {
