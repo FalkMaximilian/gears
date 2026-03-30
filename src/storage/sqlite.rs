@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 use tokio_rusqlite::Connection;
 use uuid::Uuid;
 
 use crate::error::{Result, ZdflowError};
 use crate::event::{EventPayload, WorkflowEvent};
-use crate::traits::{RunFilter, RunInfo, RunRecord, RunStatus, Storage, StorageFuture};
+use crate::traits::{
+    RunFilter, RunInfo, RunRecord, RunStatus, ScheduleRecord, ScheduleStatus, Storage,
+    StorageFuture,
+};
 
 /// SQLite-backed durable storage for workflow events and run state.
 ///
@@ -59,6 +62,16 @@ impl SqliteStorage {
 
                     CREATE INDEX IF NOT EXISTS idx_events_run
                         ON workflow_events(run_id, sequence);
+
+                    CREATE TABLE IF NOT EXISTS workflow_schedules (
+                        name             TEXT PRIMARY KEY,
+                        cron_expression  TEXT NOT NULL,
+                        workflow_name    TEXT NOT NULL,
+                        input            TEXT NOT NULL,
+                        status           TEXT NOT NULL,
+                        created_at       INTEGER NOT NULL,
+                        last_fired_at    INTEGER
+                    );
                     ",
                 )?;
                 Ok(())
@@ -367,6 +380,220 @@ impl Storage for SqliteStorage {
             Ok(result)
         })
     }
+
+    // ── Schedule persistence ──────────────────────────────────────────────
+
+    fn upsert_schedule(&self, record: &ScheduleRecord) -> StorageFuture<()> {
+        let conn = self.conn.clone();
+        let name = record.name.clone();
+        let cron_expression = record.cron_expression.clone();
+        let workflow_name = record.workflow_name.clone();
+        let input_json = match serde_json::to_string(&record.input) {
+            Ok(s) => s,
+            Err(e) => return Box::pin(async move { Err(ZdflowError::Serialize(e)) }),
+        };
+        let status_str = match record.status {
+            ScheduleStatus::Active => "active",
+            ScheduleStatus::Paused => "paused",
+        }
+        .to_string();
+        let created_at = record.created_at.timestamp_millis();
+
+        Box::pin(async move {
+            conn.call(move |conn| {
+                conn.execute(
+                    "INSERT INTO workflow_schedules
+                         (name, cron_expression, workflow_name, input, status, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(name) DO UPDATE SET
+                         cron_expression = excluded.cron_expression,
+                         workflow_name   = excluded.workflow_name,
+                         input           = excluded.input,
+                         status          = excluded.status",
+                    rusqlite::params![name, cron_expression, workflow_name, input_json, status_str, created_at],
+                )?;
+                Ok(())
+            })
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn get_schedule(&self, name: &str) -> StorageFuture<Option<ScheduleRecord>> {
+        let conn = self.conn.clone();
+        let name = name.to_string();
+
+        Box::pin(async move {
+            let row_opt: Option<ScheduleRow> = conn
+                .call(move |conn| {
+                    let mut stmt = conn.prepare(
+                        "SELECT name, cron_expression, workflow_name, input, status,
+                                created_at, last_fired_at
+                         FROM workflow_schedules WHERE name = ?1",
+                    )?;
+                    let mut rows = stmt.query(rusqlite::params![name])?;
+                    if let Some(row) = rows.next()? {
+                        Ok(Some((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, Option<i64>>(6)?,
+                        )))
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .await?;
+
+            match row_opt {
+                None => Ok(None),
+                Some((name, cron_expr, wf_name, input_json, status_str, created_ms, fired_ms)) => {
+                    Ok(Some(parse_schedule_row(
+                        name, cron_expr, wf_name, input_json, status_str, created_ms, fired_ms,
+                    )?))
+                }
+            }
+        })
+    }
+
+    fn list_schedules(&self) -> StorageFuture<Vec<ScheduleRecord>> {
+        let conn = self.conn.clone();
+
+        Box::pin(async move {
+            let rows: Vec<ScheduleRow> = conn
+                .call(|conn| {
+                    let mut stmt = conn.prepare(
+                        "SELECT name, cron_expression, workflow_name, input, status,
+                                created_at, last_fired_at
+                         FROM workflow_schedules
+                         ORDER BY created_at DESC",
+                    )?;
+                    let rows = stmt
+                        .query_map([], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, i64>(5)?,
+                                row.get::<_, Option<i64>>(6)?,
+                            ))
+                        })?
+                        .collect::<std::result::Result<_, _>>()?;
+                    Ok(rows)
+                })
+                .await?;
+
+            let mut result = Vec::with_capacity(rows.len());
+            for (name, cron_expr, wf_name, input_json, status_str, created_ms, fired_ms) in rows {
+                result.push(parse_schedule_row(
+                    name, cron_expr, wf_name, input_json, status_str, created_ms, fired_ms,
+                )?);
+            }
+            Ok(result)
+        })
+    }
+
+    fn delete_schedule(&self, name: &str) -> StorageFuture<()> {
+        let conn = self.conn.clone();
+        let name = name.to_string();
+
+        Box::pin(async move {
+            conn.call(move |conn| {
+                conn.execute(
+                    "DELETE FROM workflow_schedules WHERE name = ?1",
+                    rusqlite::params![name],
+                )?;
+                Ok(())
+            })
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn set_schedule_status(&self, name: &str, status: ScheduleStatus) -> StorageFuture<()> {
+        let conn = self.conn.clone();
+        let name = name.to_string();
+        let status_str = match status {
+            ScheduleStatus::Active => "active",
+            ScheduleStatus::Paused => "paused",
+        }
+        .to_string();
+
+        Box::pin(async move {
+            conn.call(move |conn| {
+                conn.execute(
+                    "UPDATE workflow_schedules SET status = ?1 WHERE name = ?2",
+                    rusqlite::params![status_str, name],
+                )?;
+                Ok(())
+            })
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn record_schedule_fired(&self, name: &str, fired_at: DateTime<Utc>) -> StorageFuture<()> {
+        let conn = self.conn.clone();
+        let name = name.to_string();
+        let fired_at_ms = fired_at.timestamp_millis();
+
+        Box::pin(async move {
+            conn.call(move |conn| {
+                conn.execute(
+                    "UPDATE workflow_schedules SET last_fired_at = ?1 WHERE name = ?2",
+                    rusqlite::params![fired_at_ms, name],
+                )?;
+                Ok(())
+            })
+            .await?;
+            Ok(())
+        })
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+/// Raw column tuple returned by schedule SELECT queries.
+type ScheduleRow = (String, String, String, String, String, i64, Option<i64>);
+
+fn parse_schedule_row(
+    name: String,
+    cron_expression: String,
+    workflow_name: String,
+    input_json: String,
+    status_str: String,
+    created_at_ms: i64,
+    last_fired_ms: Option<i64>,
+) -> crate::error::Result<ScheduleRecord> {
+    use chrono::TimeZone;
+    let input: Value = serde_json::from_str(&input_json)?;
+    let status = match status_str.as_str() {
+        "active" => ScheduleStatus::Active,
+        _ => ScheduleStatus::Paused,
+    };
+    let created_at = Utc
+        .timestamp_millis_opt(created_at_ms)
+        .single()
+        .unwrap_or_else(Utc::now);
+    let last_fired_at = last_fired_ms.map(|ms| {
+        Utc.timestamp_millis_opt(ms)
+            .single()
+            .unwrap_or_else(Utc::now)
+    });
+    Ok(ScheduleRecord {
+        name,
+        cron_expression,
+        workflow_name,
+        input,
+        status,
+        created_at,
+        last_fired_at,
+    })
 }
 
 #[cfg(test)]

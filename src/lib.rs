@@ -14,6 +14,6 @@ pub use error::{Result, ZdflowError};
 pub use event::{EventPayload, WorkflowEvent};
 pub use storage::SqliteStorage;
 pub use traits::{
-    Activity, ActivityFuture, RunFilter, RunInfo, RunRecord, RunStatus, Storage, Workflow,
-    WorkflowFuture,
+    Activity, ActivityFuture, RunFilter, RunInfo, RunRecord, RunStatus, ScheduleRecord,
+    ScheduleStatus, Storage, Workflow, WorkflowFuture,
 };

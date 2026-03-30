@@ -175,6 +175,58 @@ engine.cancel_workflow(run_id).await?;
 
 Workflows can also check `ctx.is_cancelled()` for cooperative cancellation within long-running logic.
 
+### Scheduled workflows
+
+`engine.schedule_workflow()` fires a workflow on a cron schedule. Schedules are persisted in SQLite and automatically re-registered on engine restart.
+
+```rust
+// Register a schedule — fires every day at 08:00 on weekdays.
+engine
+    .schedule_workflow(
+        "daily-report",          // stable name (primary key)
+        "0 0 8 * * Mon-Fri",     // 6-field cron: sec min hour dom month dow
+        "generate_report",       // registered workflow name
+        json!({"type": "daily"}),
+    )
+    .await?;
+
+// List all schedules
+let schedules = engine.list_schedules().await?;
+for s in &schedules {
+    println!("{} — {:?} — last fired: {:?}", s.name, s.status, s.last_fired_at);
+}
+
+// Pause (no missed fires are replayed on resume)
+engine.pause_schedule("daily-report").await?;
+
+// Resume (fires at the next future cron slot)
+engine.resume_schedule("daily-report").await?;
+
+// Permanently delete
+engine.delete_schedule("daily-report").await?;
+```
+
+**Cron expression format** — 6-field standard: `sec min hour dom month dow`
+
+| Field | Values |
+|---|---|
+| sec | 0–59 or `*/N` |
+| min | 0–59 or `*/N` |
+| hour | 0–23 or `*/N` |
+| dom | 1–31, `*` |
+| month | 1–12, `Jan`–`Dec`, `*` |
+| dow | 0–7 (0=Sun), `Sun`–`Sat`, `*` |
+
+Examples:
+- `"*/30 * * * * *"` — every 30 seconds
+- `"0 0 9 * * Mon-Fri"` — weekdays at 09:00
+- `"0 0 0 1 * *"` — first of every month at midnight
+
+**Behaviour notes:**
+- Calling `schedule_workflow` with an existing name replaces the schedule (new cron expression takes effect immediately).
+- Paused schedules skip missed fires. On `resume_schedule`, the next future cron slot is used.
+- Overlapping runs are allowed by default: if a workflow run is still in-progress when the next tick fires, a new run is started in parallel.
+
 ### Run listing and search
 
 `engine.list_runs()` returns workflow runs matching a filter:
@@ -479,6 +531,7 @@ Implement the `Storage` trait to use a different persistence backend:
 
 ```rust
 pub trait Storage: Send + Sync + 'static {
+    // Workflow runs
     fn create_run(&self, run_id: Uuid, workflow_name: &str, input: &Value) -> StorageFuture<()>;
     fn append_event(&self, run_id: Uuid, event: &WorkflowEvent) -> StorageFuture<()>;
     fn load_events(&self, run_id: Uuid) -> StorageFuture<Vec<WorkflowEvent>>;
@@ -486,6 +539,13 @@ pub trait Storage: Send + Sync + 'static {
     fn set_run_status(&self, run_id: Uuid, status: RunStatus, result: Option<Value>) -> StorageFuture<()>;
     fn get_run_status(&self, run_id: Uuid) -> StorageFuture<RunStatus>;
     fn list_runs(&self, filter: &RunFilter) -> StorageFuture<Vec<RunInfo>>;
+    // Schedules
+    fn upsert_schedule(&self, record: &ScheduleRecord) -> StorageFuture<()>;
+    fn get_schedule(&self, name: &str) -> StorageFuture<Option<ScheduleRecord>>;
+    fn list_schedules(&self) -> StorageFuture<Vec<ScheduleRecord>>;
+    fn delete_schedule(&self, name: &str) -> StorageFuture<()>;
+    fn set_schedule_status(&self, name: &str, status: ScheduleStatus) -> StorageFuture<()>;
+    fn record_schedule_fired(&self, name: &str, fired_at: DateTime<Utc>) -> StorageFuture<()>;
 }
 ```
 
@@ -546,7 +606,8 @@ The dispatch loop holds a `Semaphore` to bound concurrent workflow executions. E
 - **Run listing and search** — `engine.list_runs(filter)` with status, name, date range, and pagination
 - **Pluggable storage** — `Storage` trait; SQLite provided out of the box (WAL mode, bundled)
 - **Concurrency limit** — semaphore-based cap on simultaneous workflow executions
-- **Graceful shutdown** — `EngineHandle::shutdown()` stops the dispatch loop
+- **Scheduled workflows** — `engine.schedule_workflow(name, cron_expr, workflow, input)` for periodic execution; `pause_schedule`, `resume_schedule`, `delete_schedule`, `list_schedules` for lifecycle management; persisted in SQLite and recovered on restart
+- **Graceful shutdown** — `EngineHandle::shutdown()` stops the dispatch loop and cron scheduler
 - **Structured logging** — `tracing` integration with `RUST_LOG` env filter
 - **Run status polling** — `engine.get_run_status(run_id)`
 - **Metrics** — optional Prometheus-compatible counters/gauges/histograms via `metrics` crate (feature-gated)
@@ -581,6 +642,6 @@ Scaling out across multiple processes or hosts would require adding a distribute
 - **Heartbeating** — long-running activities report liveness; engine can detect and restart stalled ones
 - **Connection pool** — replace the single SQLite connection with a pool for higher write throughput
 - **Alternative storage backends** — PostgreSQL, Redis, or a distributed key-value store
-- **Scheduled workflows** — `engine.schedule_workflow(name, input, cron_expr)` for periodic execution
+- **Overlap policy** — configurable overlap policy (e.g. skip if already running, queue, or allow parallel) per schedule
 - **Determinism checker** — a test-mode that re-executes workflows twice and panics on divergence, to catch non-determinism bugs early
 - **Snapshots / checkpoints** — persist intermediate workflow state to bound replay time for long-running workflows

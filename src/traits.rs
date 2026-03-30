@@ -110,6 +110,36 @@ pub struct RunInfo {
     pub updated_at: DateTime<Utc>,
 }
 
+// ── Scheduled workflows ───────────────────────────────────────────────────
+
+/// Whether a cron schedule is currently firing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleStatus {
+    Active,
+    Paused,
+}
+
+/// A persisted cron schedule that fires a workflow on a recurring interval.
+#[derive(Debug, Clone)]
+pub struct ScheduleRecord {
+    /// Unique, user-chosen name (e.g. `"daily-report"`). Primary key.
+    pub name: String,
+    /// Standard 6-field cron expression: `sec min hour dom month dow`.
+    /// Example: `"0 0 8 * * Mon-Fri"` — weekdays at 08:00.
+    pub cron_expression: String,
+    /// Name of the registered workflow to fire on each tick.
+    pub workflow_name: String,
+    /// Input JSON payload forwarded to every triggered run.
+    pub input: Value,
+    pub status: ScheduleStatus,
+    pub created_at: DateTime<Utc>,
+    /// Last time this schedule successfully triggered a run.
+    /// `None` if the schedule has never fired.
+    pub last_fired_at: Option<DateTime<Utc>>,
+}
+
+// ── Storage ───────────────────────────────────────────────────────────────
+
 /// Persistence backend. Implement this trait to use a different database.
 ///
 /// All methods return boxed futures so the trait is dyn-compatible and can
@@ -143,4 +173,26 @@ pub trait Storage: Send + Sync + 'static {
 
     /// List runs matching the given filter criteria.
     fn list_runs(&self, filter: &RunFilter) -> StorageFuture<Vec<RunInfo>>;
+
+    // ── Schedule persistence ──────────────────────────────────────────────
+
+    /// Insert or update a named schedule. On conflict (same name), updates
+    /// `cron_expression`, `workflow_name`, `input`, and `status`; preserves
+    /// `created_at` and `last_fired_at`.
+    fn upsert_schedule(&self, record: &ScheduleRecord) -> StorageFuture<()>;
+
+    /// Load a single schedule by name. Returns `None` if not found.
+    fn get_schedule(&self, name: &str) -> StorageFuture<Option<ScheduleRecord>>;
+
+    /// List all schedules ordered by creation time (newest first).
+    fn list_schedules(&self) -> StorageFuture<Vec<ScheduleRecord>>;
+
+    /// Hard-delete a schedule. In-flight runs are not affected.
+    fn delete_schedule(&self, name: &str) -> StorageFuture<()>;
+
+    /// Update the `status` field of a schedule.
+    fn set_schedule_status(&self, name: &str, status: ScheduleStatus) -> StorageFuture<()>;
+
+    /// Record that a schedule fired at `fired_at` (updates `last_fired_at`).
+    fn record_schedule_fired(&self, name: &str, fired_at: DateTime<Utc>) -> StorageFuture<()>;
 }

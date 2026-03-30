@@ -1,14 +1,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::Utc;
 use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
+use tokio_cron_scheduler::{Job, JobScheduler};
 use uuid::Uuid;
 
 use crate::context::WorkflowContext;
 use crate::error::{Result, ZdflowError};
 use crate::metrics;
-use crate::traits::{Activity, RunFilter, RunInfo, RunStatus, Storage, Workflow};
+use crate::traits::{
+    Activity, RunFilter, RunInfo, RunStatus, ScheduleRecord, ScheduleStatus, Storage, Workflow,
+};
 use crate::worker::WorkerTask;
 
 // ── Internal message types ────────────────────────────────────────────────
@@ -74,6 +78,12 @@ impl WorkflowEngineBuilder {
 
         let (start_tx, start_rx) = mpsc::channel::<StartRequest>(1024);
 
+        let job_scheduler = Arc::new(Mutex::new(
+            JobScheduler::new()
+                .await
+                .map_err(|e| ZdflowError::Other(format!("scheduler init failed: {e}")))?,
+        ));
+
         Ok(WorkflowEngine {
             storage,
             workflows: Arc::new(self.workflows),
@@ -82,6 +92,8 @@ impl WorkflowEngineBuilder {
             start_rx: Some(start_rx),
             max_concurrent: self.max_concurrent,
             cancel_handles: Arc::new(Mutex::new(HashMap::new())),
+            job_scheduler,
+            job_handles: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -97,6 +109,9 @@ pub struct WorkflowEngine {
     start_rx: Option<mpsc::Receiver<StartRequest>>,
     max_concurrent: usize,
     cancel_handles: CancelHandles,
+    job_scheduler: Arc<Mutex<JobScheduler>>,
+    /// Maps schedule name → scheduler job UUID (for pause/remove).
+    job_handles: Arc<Mutex<HashMap<String, Uuid>>>,
 }
 
 impl WorkflowEngine {
@@ -146,7 +161,47 @@ impl WorkflowEngine {
             cancel_handles,
         ));
 
-        Ok(EngineHandle { shutdown_tx })
+        // Re-register all active schedules persisted from previous runs.
+        let all_schedules = self.storage.list_schedules().await?;
+        {
+            let mut handles = self.job_handles.lock().await;
+            for schedule in all_schedules {
+                if schedule.status != ScheduleStatus::Active {
+                    continue;
+                }
+                // Skip schedules already registered (e.g. via schedule_workflow
+                // called before run()).
+                if handles.contains_key(&schedule.name) {
+                    continue;
+                }
+                let job = build_scheduler_job(
+                    &schedule,
+                    self.start_tx.clone(),
+                    self.storage.clone(),
+                )?;
+                let job_uuid = self
+                    .job_scheduler
+                    .lock()
+                    .await
+                    .add(job)
+                    .await
+                    .map_err(|e| ZdflowError::Other(format!("failed to add job: {e}")))?;
+                handles.insert(schedule.name.clone(), job_uuid);
+                tracing::info!(schedule = %schedule.name, "schedule recovered");
+            }
+        }
+
+        self.job_scheduler
+            .lock()
+            .await
+            .start()
+            .await
+            .map_err(|e| ZdflowError::Other(format!("scheduler start failed: {e}")))?;
+
+        Ok(EngineHandle {
+            shutdown_tx,
+            job_scheduler: self.job_scheduler.clone(),
+        })
     }
 
     /// Enqueue a new workflow run. Returns the run ID immediately;
@@ -198,6 +253,120 @@ impl WorkflowEngine {
                 "no active workflow with run_id {run_id}"
             )))
         }
+    }
+
+    // ── Scheduled workflows ───────────────────────────────────────────────
+
+    /// Register (or update) a named cron schedule. `cron_expression` must be
+    /// a standard 6-field expression: `sec min hour dom month dow`.
+    /// Example: `"0 0 9 * * Mon-Fri"` — weekdays at 09:00.
+    ///
+    /// If a schedule with this name already exists it is replaced (the old
+    /// scheduler job is removed before the new one is added).
+    pub async fn schedule_workflow(
+        &self,
+        name: &str,
+        cron_expression: &str,
+        workflow_name: &str,
+        input: Value,
+    ) -> Result<()> {
+        if !self.workflows.contains_key(workflow_name) {
+            return Err(ZdflowError::WorkflowNotFound(workflow_name.to_string()));
+        }
+
+        // Remove any existing job for this schedule name.
+        if let Some(old_uuid) = self.job_handles.lock().await.remove(name) {
+            let _ = self.job_scheduler.lock().await.remove(&old_uuid).await;
+        }
+
+        let record = ScheduleRecord {
+            name: name.to_string(),
+            cron_expression: cron_expression.to_string(),
+            workflow_name: workflow_name.to_string(),
+            input: input.clone(),
+            status: ScheduleStatus::Active,
+            created_at: Utc::now(),
+            last_fired_at: None,
+        };
+
+        let job = build_scheduler_job(&record, self.start_tx.clone(), self.storage.clone())?;
+        let job_uuid = self
+            .job_scheduler
+            .lock()
+            .await
+            .add(job)
+            .await
+            .map_err(|e| ZdflowError::Other(format!("failed to add scheduled job: {e}")))?;
+
+        self.job_handles.lock().await.insert(name.to_string(), job_uuid);
+        self.storage.upsert_schedule(&record).await?;
+
+        tracing::info!(schedule = name, workflow = workflow_name, "schedule registered");
+        Ok(())
+    }
+
+    /// List all registered schedules.
+    pub async fn list_schedules(&self) -> Result<Vec<ScheduleRecord>> {
+        self.storage.list_schedules().await
+    }
+
+    /// Permanently remove a schedule. In-flight runs are not affected.
+    pub async fn delete_schedule(&self, name: &str) -> Result<()> {
+        if let Some(uuid) = self.job_handles.lock().await.remove(name) {
+            let _ = self.job_scheduler.lock().await.remove(&uuid).await;
+        }
+        self.storage.delete_schedule(name).await?;
+        tracing::info!(schedule = name, "schedule deleted");
+        Ok(())
+    }
+
+    /// Suspend a schedule without deleting it. The next fire is skipped;
+    /// call `resume_schedule` to re-enable from the next future cron slot.
+    pub async fn pause_schedule(&self, name: &str) -> Result<()> {
+        let uuid = self
+            .job_handles
+            .lock()
+            .await
+            .remove(name)
+            .ok_or_else(|| ZdflowError::Other(format!("no active schedule '{name}'")))?;
+        let _ = self.job_scheduler.lock().await.remove(&uuid).await;
+        self.storage
+            .set_schedule_status(name, ScheduleStatus::Paused)
+            .await?;
+        tracing::info!(schedule = name, "schedule paused");
+        Ok(())
+    }
+
+    /// Resume a paused schedule. The next tick after the next future cron
+    /// slot will fire the workflow. Missed fires while paused are not
+    /// replayed.
+    pub async fn resume_schedule(&self, name: &str) -> Result<()> {
+        // Idempotent: if already running, do nothing.
+        if self.job_handles.lock().await.contains_key(name) {
+            return Ok(());
+        }
+
+        let record = self
+            .storage
+            .get_schedule(name)
+            .await?
+            .ok_or_else(|| ZdflowError::Other(format!("schedule '{name}' not found")))?;
+
+        let job = build_scheduler_job(&record, self.start_tx.clone(), self.storage.clone())?;
+        let job_uuid = self
+            .job_scheduler
+            .lock()
+            .await
+            .add(job)
+            .await
+            .map_err(|e| ZdflowError::Other(format!("failed to add scheduled job: {e}")))?;
+
+        self.job_handles.lock().await.insert(name.to_string(), job_uuid);
+        self.storage
+            .set_schedule_status(name, ScheduleStatus::Active)
+            .await?;
+        tracing::info!(schedule = name, "schedule resumed");
+        Ok(())
     }
 }
 
@@ -260,16 +429,69 @@ async fn dispatch_loop(
     }
 }
 
+// ── Scheduler job builder ─────────────────────────────────────────────────
+
+/// Build a `tokio-cron-scheduler` job that fires `start_workflow` on each tick.
+fn build_scheduler_job(
+    schedule: &ScheduleRecord,
+    start_tx: mpsc::Sender<StartRequest>,
+    storage: Arc<dyn Storage>,
+) -> Result<Job> {
+    let name = schedule.name.clone();
+    let workflow_name = schedule.workflow_name.clone();
+    let input = schedule.input.clone();
+
+    Job::new_async(schedule.cron_expression.as_str(), move |_uuid, _l| {
+        let name = name.clone();
+        let workflow_name = workflow_name.clone();
+        let input = input.clone();
+        let start_tx = start_tx.clone();
+        let storage = storage.clone();
+
+        Box::pin(async move {
+            let run_id = Uuid::new_v4();
+            if let Err(e) = storage.create_run(run_id, &workflow_name, &input).await {
+                tracing::error!(
+                    schedule = %name,
+                    error = %e,
+                    "failed to create scheduled run"
+                );
+                return;
+            }
+            let _ = storage.record_schedule_fired(&name, Utc::now()).await;
+            if start_tx
+                .send(StartRequest {
+                    run_id,
+                    workflow_name: workflow_name.clone(),
+                    input: input.clone(),
+                })
+                .await
+                .is_err()
+            {
+                tracing::error!(
+                    schedule = %name,
+                    "dispatch channel closed — run created but not dispatched"
+                );
+                return;
+            }
+            tracing::info!(schedule = %name, %run_id, workflow = %workflow_name, "schedule fired");
+        })
+    })
+    .map_err(|e| ZdflowError::Other(format!("invalid cron expression: {e}")))
+}
+
 // ── EngineHandle ──────────────────────────────────────────────────────────
 
 /// Returned by `WorkflowEngine::run()`. Drop it or call `shutdown()` to
-/// stop the dispatch loop.
+/// stop the dispatch loop and the cron scheduler.
 pub struct EngineHandle {
     shutdown_tx: oneshot::Sender<()>,
+    job_scheduler: Arc<Mutex<JobScheduler>>,
 }
 
 impl EngineHandle {
     pub async fn shutdown(self) {
+        let _ = self.job_scheduler.lock().await.shutdown().await;
         let _ = self.shutdown_tx.send(());
     }
 }
