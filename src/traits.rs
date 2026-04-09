@@ -171,6 +171,10 @@ pub trait Storage: Send + Sync + 'static {
     /// Query the status of a run.
     fn get_run_status(&self, run_id: Uuid) -> StorageFuture<RunStatus>;
 
+    /// Retrieve the stored result (output JSON) for a completed run.
+    /// Returns `None` if the run has not completed or has no result.
+    fn get_run_result(&self, run_id: Uuid) -> StorageFuture<Option<Value>>;
+
     /// List runs matching the given filter criteria.
     fn list_runs(&self, filter: &RunFilter) -> StorageFuture<Vec<RunInfo>>;
 

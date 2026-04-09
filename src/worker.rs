@@ -124,6 +124,7 @@ async fn run_cleanups(
             activity_name: activity_name.clone(),
             attempt: 1,
             sequence_id: seq_id,
+            shared_state: worker_ctx.shared_state_value(),
         };
 
         tracing::info!(
@@ -136,7 +137,9 @@ async fn run_cleanups(
         match activity.execute(cleanup_ctx, input).await {
             Ok(_) => {
                 let _ = worker_ctx
-                    .append_event(EventPayload::CleanupCompleted { sequence_id: seq_id })
+                    .append_event(EventPayload::CleanupCompleted {
+                        sequence_id: seq_id,
+                    })
                     .await;
                 tracing::info!(run_id = %run_id, activity = %activity_name, "cleanup completed");
             }
@@ -197,7 +200,12 @@ impl WorkerTask {
         metrics::inc_workflow_active();
 
         // Build the context with the activity registry.
-        let ctx = WorkflowContext::new(run_id, self.history, self.storage.clone(), self.activities.clone());
+        let ctx = WorkflowContext::new(
+            run_id,
+            self.history,
+            self.storage.clone(),
+            self.activities.clone(),
+        );
 
         // Register cancel handle so the engine can cancel this workflow.
         {

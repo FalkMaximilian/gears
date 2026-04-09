@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio_cron_scheduler::{Job, JobScheduler};
@@ -78,11 +80,10 @@ impl WorkflowEngineBuilder {
 
         let (start_tx, start_rx) = mpsc::channel::<StartRequest>(1024);
 
-        let job_scheduler = Arc::new(Mutex::new(
-            JobScheduler::new()
-                .await
-                .map_err(|e| ZdflowError::Other(format!("scheduler init failed: {e}")))?,
-        ));
+        let job_scheduler =
+            Arc::new(Mutex::new(JobScheduler::new().await.map_err(|e| {
+                ZdflowError::Other(format!("scheduler init failed: {e}"))
+            })?));
 
         Ok(WorkflowEngine {
             storage,
@@ -174,11 +175,8 @@ impl WorkflowEngine {
                 if handles.contains_key(&schedule.name) {
                     continue;
                 }
-                let job = build_scheduler_job(
-                    &schedule,
-                    self.start_tx.clone(),
-                    self.storage.clone(),
-                )?;
+                let job =
+                    build_scheduler_job(&schedule, self.start_tx.clone(), self.storage.clone())?;
                 let job_uuid = self
                     .job_scheduler
                     .lock()
@@ -255,6 +253,36 @@ impl WorkflowEngine {
         }
     }
 
+    // ── Typed convenience methods ────────────────────────────────────────
+
+    /// Start a workflow with a typed input. The input is serialized to JSON.
+    pub async fn start_workflow_typed<I: Serialize>(
+        &self,
+        workflow_name: &str,
+        input: &I,
+    ) -> Result<Uuid> {
+        let value = serde_json::to_value(input)?;
+        self.start_workflow(workflow_name, value).await
+    }
+
+    /// Retrieve the raw JSON result of a completed workflow run.
+    /// Returns `Ok(None)` if the run has not completed or has no result.
+    pub async fn get_run_result(&self, run_id: Uuid) -> Result<Option<Value>> {
+        self.storage.get_run_result(run_id).await
+    }
+
+    /// Retrieve the result of a completed workflow run, deserialized into `T`.
+    /// Returns `Ok(None)` if the run has not completed or has no result.
+    pub async fn get_run_result_typed<T: DeserializeOwned>(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Option<T>> {
+        match self.storage.get_run_result(run_id).await? {
+            Some(value) => Ok(Some(serde_json::from_value(value)?)),
+            None => Ok(None),
+        }
+    }
+
     // ── Scheduled workflows ───────────────────────────────────────────────
 
     /// Register (or update) a named cron schedule. `cron_expression` must be
@@ -298,10 +326,17 @@ impl WorkflowEngine {
             .await
             .map_err(|e| ZdflowError::Other(format!("failed to add scheduled job: {e}")))?;
 
-        self.job_handles.lock().await.insert(name.to_string(), job_uuid);
+        self.job_handles
+            .lock()
+            .await
+            .insert(name.to_string(), job_uuid);
         self.storage.upsert_schedule(&record).await?;
 
-        tracing::info!(schedule = name, workflow = workflow_name, "schedule registered");
+        tracing::info!(
+            schedule = name,
+            workflow = workflow_name,
+            "schedule registered"
+        );
         Ok(())
     }
 
@@ -361,7 +396,10 @@ impl WorkflowEngine {
             .await
             .map_err(|e| ZdflowError::Other(format!("failed to add scheduled job: {e}")))?;
 
-        self.job_handles.lock().await.insert(name.to_string(), job_uuid);
+        self.job_handles
+            .lock()
+            .await
+            .insert(name.to_string(), job_uuid);
         self.storage
             .set_schedule_status(name, ScheduleStatus::Active)
             .await?;

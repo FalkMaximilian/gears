@@ -278,6 +278,34 @@ impl Storage for SqliteStorage {
         })
     }
 
+    fn get_run_result(&self, run_id: Uuid) -> StorageFuture<Option<Value>> {
+        let conn = self.conn.clone();
+        let run_id_str = run_id.to_string();
+
+        Box::pin(async move {
+            let result_opt: Option<String> = conn
+                .call(move |conn| {
+                    let mut stmt =
+                        conn.prepare("SELECT result FROM workflow_runs WHERE run_id = ?1")?;
+                    let mut rows = stmt.query(rusqlite::params![run_id_str])?;
+                    if let Some(row) = rows.next()? {
+                        Ok(row.get::<_, Option<String>>(0)?)
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .await?;
+
+            match result_opt {
+                Some(json_str) => {
+                    let value: Value = serde_json::from_str(&json_str)?;
+                    Ok(Some(value))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
     fn list_runs(&self, filter: &RunFilter) -> StorageFuture<Vec<RunInfo>> {
         let conn = self.conn.clone();
 
@@ -410,7 +438,14 @@ impl Storage for SqliteStorage {
                          workflow_name   = excluded.workflow_name,
                          input           = excluded.input,
                          status          = excluded.status",
-                    rusqlite::params![name, cron_expression, workflow_name, input_json, status_str, created_at],
+                    rusqlite::params![
+                        name,
+                        cron_expression,
+                        workflow_name,
+                        input_json,
+                        status_str,
+                        created_at
+                    ],
                 )?;
                 Ok(())
             })

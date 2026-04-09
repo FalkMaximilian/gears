@@ -1,8 +1,11 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -16,7 +19,7 @@ use std::collections::HashMap;
 // ── ActivityContext ───────────────────────────────────────────────────────
 
 /// Passed to every activity execution. Contains metadata about the
-/// current attempt; no back-channel to the engine.
+/// current attempt and optional shared workflow state.
 #[derive(Debug, Clone)]
 pub struct ActivityContext {
     pub run_id: Uuid,
@@ -25,6 +28,24 @@ pub struct ActivityContext {
     pub attempt: u32,
     /// Logical call index within this workflow run.
     pub sequence_id: u32,
+    /// Shared state set by the workflow via
+    /// [`WorkflowContext::set_shared_state`]. `None` if never set.
+    pub(crate) shared_state: Option<Value>,
+}
+
+impl ActivityContext {
+    /// Deserialize the shared workflow state into `T`.
+    ///
+    /// Returns an error if no shared state has been set or if
+    /// deserialization fails.
+    pub fn shared_state<T: DeserializeOwned>(&self) -> Result<T> {
+        match &self.shared_state {
+            Some(v) => Ok(serde_json::from_value(v.clone())?),
+            None => Err(ZdflowError::Other(
+                "no shared state has been set on this workflow".into(),
+            )),
+        }
+    }
 }
 
 // ── WorkflowContext ───────────────────────────────────────────────────────
@@ -54,6 +75,8 @@ struct ContextInner {
     cancelled: AtomicBool,
     /// Notified when the workflow is cancelled.
     cancel_notify: tokio::sync::Notify,
+    /// User-set shared state, accessible by all activities in this run.
+    shared_state: Mutex<Option<Value>>,
 }
 
 impl WorkflowContext {
@@ -76,6 +99,7 @@ impl WorkflowContext {
                 activities,
                 cancelled: AtomicBool::new(false),
                 cancel_notify: tokio::sync::Notify::new(),
+                shared_state: Mutex::new(None),
             }),
         }
     }
@@ -103,6 +127,93 @@ impl WorkflowContext {
         } else {
             Ok(())
         }
+    }
+
+    // ── shared state ─────────────────────────────────────────────────────
+
+    /// Store a value as shared workflow state.
+    ///
+    /// Once set, every [`ActivityContext`] created for subsequent activity
+    /// executions in this run will carry a copy of this state. Activities
+    /// can retrieve it with [`ActivityContext::shared_state`].
+    ///
+    /// This is **not** persisted as an event — it lives only in memory.
+    /// Because the workflow function is re-executed from the top on replay,
+    /// the state is deterministically re-established before any activities
+    /// run.
+    ///
+    /// Typical pattern: set shared state once at the beginning of a
+    /// workflow so every activity has access to common data (trace IDs,
+    /// user context, etc.) without threading it through every call.
+    pub fn set_shared_state<T: Serialize>(&self, state: &T) -> Result<()> {
+        let value = serde_json::to_value(state)?;
+        *self.inner.shared_state.lock().unwrap() = Some(value);
+        Ok(())
+    }
+
+    /// Retrieve the shared workflow state, deserialized into `T`.
+    ///
+    /// Returns an error if no shared state has been set.
+    pub fn shared_state<T: DeserializeOwned>(&self) -> Result<T> {
+        let guard = self.inner.shared_state.lock().unwrap();
+        match &*guard {
+            Some(v) => Ok(serde_json::from_value(v.clone())?),
+            None => Err(ZdflowError::Other(
+                "no shared state has been set on this workflow".into(),
+            )),
+        }
+    }
+
+    /// Read the current shared state as a raw `Value`.
+    pub(crate) fn shared_state_value(&self) -> Option<Value> {
+        self.inner.shared_state.lock().unwrap().clone()
+    }
+
+    // ── typed convenience methods ────────────────────────────────────────
+
+    /// Execute an activity, automatically serializing the input and
+    /// deserializing the output.
+    ///
+    /// This is a typed wrapper around [`execute_activity`](Self::execute_activity).
+    pub async fn execute_activity_typed<I, O>(&self, activity_name: &str, input: &I) -> Result<O>
+    where
+        I: Serialize,
+        O: DeserializeOwned,
+    {
+        let value = serde_json::to_value(input)?;
+        let result = self.execute_activity(activity_name, value).await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// Execute multiple activities in parallel, deserializing all results
+    /// into the same type `O`.
+    ///
+    /// This is a typed wrapper around
+    /// [`execute_activities_parallel`](Self::execute_activities_parallel).
+    pub async fn execute_activities_parallel_typed<O>(
+        &self,
+        activities: Vec<(&str, Value)>,
+    ) -> Result<Vec<O>>
+    where
+        O: DeserializeOwned,
+    {
+        let results = self.execute_activities_parallel(activities).await?;
+        results
+            .into_iter()
+            .map(|v| serde_json::from_value(v).map_err(Into::into))
+            .collect()
+    }
+
+    /// Register a cleanup activity with a typed input.
+    ///
+    /// This is a typed wrapper around [`register_cleanup`](Self::register_cleanup).
+    pub async fn register_cleanup_typed<I: Serialize>(
+        &self,
+        activity_name: &str,
+        input: &I,
+    ) -> Result<()> {
+        let value = serde_json::to_value(input)?;
+        self.register_cleanup(activity_name, value).await
     }
 
     // ── execute_activity ─────────────────────────────────────────────────
@@ -188,6 +299,7 @@ impl WorkflowContext {
                 activity_name: activity.name().to_string(),
                 attempt,
                 sequence_id,
+                shared_state: self.shared_state_value(),
             };
 
             tracing::debug!(

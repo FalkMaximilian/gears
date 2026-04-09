@@ -1,11 +1,13 @@
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use zdflow::{
-    Activity, ActivityContext, ActivityFuture, RunFilter, RunStatus, SqliteStorage, Workflow,
-    WorkflowContext, WorkflowEngine, WorkflowFuture, ZdflowError,
+    Activity, ActivityContext, ActivityFuture, RunFilter, RunStatus, SqliteStorage, TypedActivity,
+    TypedActivityFuture, TypedWorkflow, TypedWorkflowFuture, Workflow, WorkflowContext,
+    WorkflowEngine, WorkflowFuture, ZdflowError,
 };
 
 // ── Test activities ──────────────────────────────────────────────────────
@@ -17,7 +19,9 @@ impl EchoActivity {
 }
 
 impl Activity for EchoActivity {
-    fn name(&self) -> &'static str { Self::NAME }
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
 
     fn execute(&self, _ctx: ActivityContext, input: Value) -> ActivityFuture {
         Box::pin(async move { Ok(input) })
@@ -31,7 +35,9 @@ impl FailActivity {
 }
 
 impl Activity for FailActivity {
-    fn name(&self) -> &'static str { Self::NAME }
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
 
     fn execute(&self, _ctx: ActivityContext, _input: Value) -> ActivityFuture {
         Box::pin(async move { Err(ZdflowError::Other("intentional failure".into())) })
@@ -49,7 +55,9 @@ impl SlowActivity {
 }
 
 impl Activity for SlowActivity {
-    fn name(&self) -> &'static str { Self::NAME }
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
 
     fn execute(&self, _ctx: ActivityContext, _input: Value) -> ActivityFuture {
         Box::pin(async move {
@@ -80,7 +88,9 @@ impl SimpleWorkflow {
 }
 
 impl Workflow for SimpleWorkflow {
-    fn name(&self) -> &'static str { Self::NAME }
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
 
     fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture {
         Box::pin(async move { ctx.execute_activity(EchoActivity::NAME, input).await })
@@ -94,7 +104,9 @@ impl FailingWorkflow {
 }
 
 impl Workflow for FailingWorkflow {
-    fn name(&self) -> &'static str { Self::NAME }
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
 
     fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
         Box::pin(async move { ctx.execute_activity(FailActivity::NAME, json!({})).await })
@@ -108,7 +120,9 @@ impl TimeoutWorkflow {
 }
 
 impl Workflow for TimeoutWorkflow {
-    fn name(&self) -> &'static str { Self::NAME }
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
 
     fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
         Box::pin(async move { ctx.execute_activity(SlowActivity::NAME, json!({})).await })
@@ -122,7 +136,9 @@ impl SleepyWorkflow {
 }
 
 impl Workflow for SleepyWorkflow {
-    fn name(&self) -> &'static str { Self::NAME }
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
 
     fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
         Box::pin(async move {
@@ -139,7 +155,9 @@ impl ParallelWorkflow {
 }
 
 impl Workflow for ParallelWorkflow {
-    fn name(&self) -> &'static str { Self::NAME }
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
 
     fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
         Box::pin(async move {
@@ -162,15 +180,21 @@ impl VersionedWorkflow {
 }
 
 impl Workflow for VersionedWorkflow {
-    fn name(&self) -> &'static str { Self::NAME }
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
 
     fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
         Box::pin(async move {
             let version = ctx.get_version("add_step_2", 1, 2).await?;
             if version >= 2 {
-                let _ = ctx.execute_activity(EchoActivity::NAME, json!({"step": 2})).await?;
+                let _ = ctx
+                    .execute_activity(EchoActivity::NAME, json!({"step": 2}))
+                    .await?;
             }
-            let result = ctx.execute_activity(EchoActivity::NAME, json!({"step": 1})).await?;
+            let result = ctx
+                .execute_activity(EchoActivity::NAME, json!({"step": 1}))
+                .await?;
             Ok(json!({"version": version, "result": result}))
         })
     }
@@ -338,6 +362,189 @@ async fn test_list_runs() {
         .await
         .unwrap();
     assert_eq!(runs.len(), 1);
+
+    handle.shutdown().await;
+}
+
+// ── Typed API test types ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct OrderVars {
+    order_id: String,
+    user_id: String,
+    trace_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct OrderResult {
+    validated: bool,
+    echoed_order_id: String,
+}
+
+// A typed activity that reads shared state from the context.
+struct ValidateOrderActivity;
+
+impl TypedActivity for ValidateOrderActivity {
+    type Input = ();
+    type Output = bool;
+
+    fn name(&self) -> &'static str {
+        "validate_order"
+    }
+
+    fn execute(&self, ctx: ActivityContext, _input: ()) -> TypedActivityFuture<bool> {
+        Box::pin(async move {
+            let vars: OrderVars = ctx.shared_state()?;
+            Ok(!vars.order_id.is_empty())
+        })
+    }
+
+    fn max_attempts(&self) -> u32 {
+        1
+    }
+}
+
+// A typed activity that accepts the full workflow struct as input.
+struct EchoOrderIdActivity;
+
+impl TypedActivity for EchoOrderIdActivity {
+    type Input = OrderVars;
+    type Output = String;
+
+    fn name(&self) -> &'static str {
+        "echo_order_id"
+    }
+
+    fn execute(&self, _ctx: ActivityContext, input: OrderVars) -> TypedActivityFuture<String> {
+        Box::pin(async move { Ok(input.order_id) })
+    }
+
+    fn max_attempts(&self) -> u32 {
+        1
+    }
+}
+
+// A typed workflow using shared state + typed context methods.
+struct TypedOrderWorkflow;
+
+impl TypedWorkflow for TypedOrderWorkflow {
+    type Input = OrderVars;
+    type Output = OrderResult;
+
+    fn name(&self) -> &'static str {
+        "typed_order"
+    }
+
+    fn run(&self, ctx: WorkflowContext, vars: OrderVars) -> TypedWorkflowFuture<OrderResult> {
+        Box::pin(async move {
+            ctx.set_shared_state(&vars)?;
+
+            let validated: bool = ctx.execute_activity_typed("validate_order", &()).await?;
+
+            let echoed_order_id: String =
+                ctx.execute_activity_typed("echo_order_id", &vars).await?;
+
+            Ok(OrderResult {
+                validated,
+                echoed_order_id,
+            })
+        })
+    }
+}
+
+async fn build_typed_engine() -> WorkflowEngine {
+    let storage = SqliteStorage::open(":memory:").await.unwrap();
+    WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(TypedOrderWorkflow)
+        .register_activity(ValidateOrderActivity)
+        .register_activity(EchoOrderIdActivity)
+        .register_activity(EchoActivity)
+        .max_concurrent_workflows(10)
+        .build()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_typed_workflow_end_to_end() {
+    let mut engine = build_typed_engine().await;
+    let handle = engine.run().await.unwrap();
+
+    let input = OrderVars {
+        order_id: "ORD-42".into(),
+        user_id: "USR-1".into(),
+        trace_id: "trace-abc".into(),
+    };
+
+    let run_id = engine
+        .start_workflow_typed("typed_order", &input)
+        .await
+        .unwrap();
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+
+    let result: Option<OrderResult> = engine.get_run_result_typed(run_id).await.unwrap();
+    let result = result.expect("should have a result");
+    assert!(result.validated);
+    assert_eq!(result.echoed_order_id, "ORD-42");
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_shared_state_validation_false() {
+    let mut engine = build_typed_engine().await;
+    let handle = engine.run().await.unwrap();
+
+    let input = OrderVars {
+        order_id: "".into(),
+        user_id: "USR-1".into(),
+        trace_id: "trace-xyz".into(),
+    };
+
+    let run_id = engine
+        .start_workflow_typed("typed_order", &input)
+        .await
+        .unwrap();
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+
+    let result: OrderResult = engine.get_run_result_typed(run_id).await.unwrap().unwrap();
+    assert!(!result.validated);
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_get_run_result_none_for_nonexistent() {
+    let mut engine = build_typed_engine().await;
+    let handle = engine.run().await.unwrap();
+
+    let result = engine.get_run_result(Uuid::new_v4()).await.unwrap();
+    assert!(result.is_none());
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_get_run_result_raw_json() {
+    let mut engine = build_typed_engine().await;
+    let handle = engine.run().await.unwrap();
+
+    let input = OrderVars {
+        order_id: "ORD-99".into(),
+        user_id: "USR-2".into(),
+        trace_id: "trace-def".into(),
+    };
+
+    let run_id = engine
+        .start_workflow_typed("typed_order", &input)
+        .await
+        .unwrap();
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+
+    let raw: Value = engine.get_run_result(run_id).await.unwrap().unwrap();
+    assert_eq!(raw["echoed_order_id"], "ORD-99");
+    assert_eq!(raw["validated"], true);
 
     handle.shutdown().await;
 }

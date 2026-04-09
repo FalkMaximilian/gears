@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use zdflow::{
-    Activity, ActivityContext, ActivityFuture, SqliteStorage, Workflow, WorkflowContext,
-    WorkflowEngine, WorkflowFuture,
+    Activity, ActivityContext, ActivityFuture, SqliteStorage, TypedActivity, TypedActivityFuture,
+    TypedWorkflow, TypedWorkflowFuture, Workflow, WorkflowContext, WorkflowEngine, WorkflowFuture,
 };
 
 // ── Activity: send a greeting ─────────────────────────────────────────────
@@ -32,7 +32,9 @@ impl SendGreetingActivity {
 }
 
 impl Activity for SendGreetingActivity {
-    fn name(&self) -> &'static str { Self::NAME }
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
 
     fn execute(&self, ctx: ActivityContext, input: Value) -> ActivityFuture {
         Box::pin(async move {
@@ -55,12 +57,16 @@ impl GreetingWorkflow {
 }
 
 impl Workflow for GreetingWorkflow {
-    fn name(&self) -> &'static str { Self::NAME }
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
 
     fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture {
         Box::pin(async move {
             // First greeting.
-            let result1 = ctx.execute_activity(SendGreetingActivity::NAME, input.clone()).await?;
+            let result1 = ctx
+                .execute_activity(SendGreetingActivity::NAME, input.clone())
+                .await?;
             println!("[workflow] first greeting: {:?}", result1["message"]);
 
             // Durable sleep — if the process crashes here and restarts,
@@ -69,7 +75,9 @@ impl Workflow for GreetingWorkflow {
             println!("[workflow] woke up after sleep");
 
             // Second greeting.
-            let result2 = ctx.execute_activity(SendGreetingActivity::NAME, input.clone()).await?;
+            let result2 = ctx
+                .execute_activity(SendGreetingActivity::NAME, input.clone())
+                .await?;
             println!("[workflow] second greeting: {:?}", result2["message"]);
 
             Ok(json!({
@@ -93,7 +101,9 @@ impl AllocateResourceActivity {
 }
 
 impl Activity for AllocateResourceActivity {
-    fn name(&self) -> &'static str { Self::NAME }
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
 
     fn execute(&self, _ctx: ActivityContext, input: Value) -> ActivityFuture {
         Box::pin(async move {
@@ -115,7 +125,9 @@ impl ReleaseResourceActivity {
 }
 
 impl Activity for ReleaseResourceActivity {
-    fn name(&self) -> &'static str { Self::NAME }
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
 
     fn execute(&self, _ctx: ActivityContext, input: Value) -> ActivityFuture {
         Box::pin(async move {
@@ -139,13 +151,16 @@ impl ResourceWorkflow {
 }
 
 impl Workflow for ResourceWorkflow {
-    fn name(&self) -> &'static str { Self::NAME }
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
 
     fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture {
         Box::pin(async move {
             // Allocate the resource.
-            let alloc =
-                ctx.execute_activity(AllocateResourceActivity::NAME, input.clone()).await?;
+            let alloc = ctx
+                .execute_activity(AllocateResourceActivity::NAME, input.clone())
+                .await?;
 
             // Register cleanup immediately after allocation. This runs even if
             // the workflow is cancelled during the sleep below.
@@ -173,12 +188,119 @@ impl HeartbeatWorkflow {
 }
 
 impl Workflow for HeartbeatWorkflow {
-    fn name(&self) -> &'static str { Self::NAME }
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
 
     fn run(&self, _ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
         Box::pin(async move {
             println!("[heartbeat] tick at {}", chrono::Utc::now());
             Ok(json!({ "status": "ok" }))
+        })
+    }
+}
+
+// ── Typed workflow demo: order processing ────────────────────────────────
+//
+// Demonstrates TypedWorkflow, TypedActivity, shared state, and
+// execute_activity_typed. One struct (OrderInput) is shared across the
+// entire workflow; activities read it via shared state or typed input.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OrderInput {
+    order_id: String,
+    customer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OrderOutput {
+    order_id: String,
+    confirmed: bool,
+    message: String,
+}
+
+struct ConfirmOrderActivity;
+
+impl TypedActivity for ConfirmOrderActivity {
+    type Input = ();
+    type Output = bool;
+
+    fn name(&self) -> &'static str {
+        "confirm_order"
+    }
+
+    fn execute(&self, ctx: ActivityContext, _input: ()) -> TypedActivityFuture<bool> {
+        Box::pin(async move {
+            // Read the shared workflow state — no explicit input needed.
+            let order: OrderInput = ctx.shared_state()?;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            println!(
+                "[activity] confirmed order {} for {}",
+                order.order_id, order.customer
+            );
+            Ok(true)
+        })
+    }
+
+    fn max_attempts(&self) -> u32 {
+        1
+    }
+}
+
+struct NotifyCustomerActivity;
+
+impl TypedActivity for NotifyCustomerActivity {
+    type Input = OrderInput;
+    type Output = String;
+
+    fn name(&self) -> &'static str {
+        "notify_customer"
+    }
+
+    fn execute(&self, _ctx: ActivityContext, input: OrderInput) -> TypedActivityFuture<String> {
+        Box::pin(async move {
+            let msg = format!(
+                "Dear {}, order {} is confirmed!",
+                input.customer, input.order_id
+            );
+            println!("[activity] {}", msg);
+            Ok(msg)
+        })
+    }
+
+    fn max_attempts(&self) -> u32 {
+        1
+    }
+}
+
+struct OrderWorkflow;
+
+impl TypedWorkflow for OrderWorkflow {
+    type Input = OrderInput;
+    type Output = OrderOutput;
+
+    fn name(&self) -> &'static str {
+        "order"
+    }
+
+    fn run(&self, ctx: WorkflowContext, input: OrderInput) -> TypedWorkflowFuture<OrderOutput> {
+        Box::pin(async move {
+            // Set shared state once — all activities can read it.
+            ctx.set_shared_state(&input)?;
+
+            // confirm_order reads shared state, no per-call input.
+            let confirmed: bool = ctx.execute_activity_typed("confirm_order", &()).await?;
+
+            // notify_customer receives the full struct.
+            let message: String = ctx
+                .execute_activity_typed("notify_customer", &input)
+                .await?;
+
+            Ok(OrderOutput {
+                order_id: input.order_id,
+                confirmed,
+                message,
+            })
         })
     }
 }
@@ -222,6 +344,23 @@ async fn start_greeting(
         .await
         .map_err(|e| {
             tracing::error!("failed to start workflow: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(GreetResponse {
+        run_id: run_id.to_string(),
+    }))
+}
+
+async fn start_order(
+    State(engine): State<Arc<WorkflowEngine>>,
+    Json(payload): Json<OrderInput>,
+) -> std::result::Result<Json<GreetResponse>, StatusCode> {
+    let run_id = engine
+        .start_workflow_typed("order", &payload)
+        .await
+        .map_err(|e| {
+            tracing::error!("failed to start order workflow: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
@@ -301,9 +440,12 @@ async fn main() -> anyhow::Result<()> {
         .register_workflow(GreetingWorkflow)
         .register_workflow(HeartbeatWorkflow)
         .register_workflow(ResourceWorkflow)
+        .register_workflow(OrderWorkflow)
         .register_activity(SendGreetingActivity)
         .register_activity(AllocateResourceActivity)
         .register_activity(ReleaseResourceActivity)
+        .register_activity(ConfirmOrderActivity)
+        .register_activity(NotifyCustomerActivity)
         .max_concurrent_workflows(50)
         .build()
         .await?;
@@ -326,6 +468,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/greet", post(start_greeting))
         .route("/resource", post(start_resource_workflow))
+        .route("/order", post(start_order))
         .route("/schedules", get(list_schedules_handler))
         .route("/schedules/{name}/pause", post(pause_schedule_handler))
         .route("/schedules/{name}/resume", post(resume_schedule_handler))
@@ -339,6 +482,9 @@ async fn main() -> anyhow::Result<()> {
     println!("     curl http://localhost:3000/schedules");
     println!(
         "     curl -X POST http://localhost:3000/resource -H 'Content-Type: application/json' -d '{{\"resource\": \"my-vm\"}}'"
+    );
+    println!(
+        "     curl -X POST http://localhost:3000/order -H 'Content-Type: application/json' -d '{{\"order_id\": \"ORD-1\", \"customer\": \"Alice\"}}'"
     );
 
     tokio::select! {

@@ -113,6 +113,119 @@ impl Activity for MyActivity {
 
 Retry timing: delay before attempt `n` = `base_delay × 2^(n-1)`.
 
+### Typed workflows and activities
+
+The `TypedWorkflow` and `TypedActivity` traits let you work with strongly-typed inputs and outputs instead of raw `serde_json::Value`. They auto-implement the untyped `Workflow`/`Activity` traits via blanket impls, so engine registration is unchanged.
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct OrderInput {
+    order_id: String,
+    customer: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OrderOutput {
+    confirmed: bool,
+    message: String,
+}
+
+struct OrderWorkflow;
+
+impl TypedWorkflow for OrderWorkflow {
+    type Input = OrderInput;
+    type Output = OrderOutput;
+
+    fn name(&self) -> &'static str { "order" }
+
+    fn run(&self, ctx: WorkflowContext, input: OrderInput) -> TypedWorkflowFuture<OrderOutput> {
+        Box::pin(async move {
+            // Set shared state so activities can read it without explicit passing.
+            ctx.set_shared_state(&input)?;
+
+            let confirmed: bool = ctx.execute_activity_typed("confirm", &()).await?;
+            let message: String = ctx.execute_activity_typed("notify", &input).await?;
+
+            Ok(OrderOutput { confirmed, message })
+        })
+    }
+}
+```
+
+Typed activities work the same way:
+
+```rust
+struct ConfirmActivity;
+
+impl TypedActivity for ConfirmActivity {
+    type Input = ();       // reads shared state instead
+    type Output = bool;
+
+    fn name(&self) -> &'static str { "confirm" }
+
+    fn execute(&self, ctx: ActivityContext, _input: ()) -> TypedActivityFuture<bool> {
+        Box::pin(async move {
+            let order: OrderInput = ctx.shared_state()?;
+            // ... validate the order ...
+            Ok(true)
+        })
+    }
+}
+```
+
+Registration is identical to untyped — the blanket impl bridges the types:
+
+```rust
+WorkflowEngine::builder()
+    .register_workflow(OrderWorkflow)
+    .register_activity(ConfirmActivity)
+    // ...
+```
+
+### Shared workflow state
+
+`ctx.set_shared_state(&value)` stores a typed value on the workflow context. Every activity executed afterwards can access it via `ctx.shared_state::<T>()` on the `ActivityContext` — no need to thread common data through every `execute_activity` call.
+
+This is ideal for the **"one big struct" pattern**: define a single variables struct per workflow, set it as shared state at the top, and let activities read what they need.
+
+```rust
+ctx.set_shared_state(&my_workflow_vars)?;
+
+// Activities automatically receive the shared state:
+let vars: MyVars = ctx.shared_state()?;            // in ActivityContext
+let vars: MyVars = workflow_ctx.shared_state()?;    // in WorkflowContext
+```
+
+Shared state is **not** persisted as an event — it lives only in memory. This is safe because the workflow function is re-executed deterministically from the top on replay, re-establishing the state before any activities run.
+
+### Typed convenience methods
+
+Typed wrappers on `WorkflowContext` handle serialization automatically:
+
+```rust
+// Typed activity execution — no manual serde_json::to_value/from_value
+let result: MyOutput = ctx.execute_activity_typed("name", &my_input).await?;
+
+// Typed parallel execution (all results must share the same type)
+let results: Vec<MyOutput> = ctx.execute_activities_parallel_typed(activities).await?;
+
+// Typed cleanup registration
+ctx.register_cleanup_typed("cleanup_name", &cleanup_input).await?;
+```
+
+Typed wrappers on `WorkflowEngine`:
+
+```rust
+// Start with typed input
+let run_id = engine.start_workflow_typed("order", &order_input).await?;
+
+// Retrieve typed result
+let result: Option<OrderOutput> = engine.get_run_result_typed(run_id).await?;
+
+// Or retrieve raw JSON
+let raw: Option<Value> = engine.get_run_result(run_id).await?;
+```
+
 ### Activity timeouts
 
 Activities can define an optional `timeout()`. If an activity does not complete within the timeout duration, the attempt is treated as a failure and may be retried (up to `max_attempts`). Each timed-out attempt persists an `ActivityAttemptTimedOut` event.
@@ -698,8 +811,9 @@ src/
 ├── lib.rs          Public API surface and re-exports
 ├── main.rs         Demo application (Axum HTTP server)
 ├── traits.rs       Workflow, Activity, Storage trait definitions
+├── typed.rs        TypedWorkflow, TypedActivity traits and blanket impls
 ├── event.rs        WorkflowEvent and EventPayload types
-├── context.rs      WorkflowContext (replay engine) and ActivityContext
+├── context.rs      WorkflowContext (replay engine, shared state) and ActivityContext
 ├── engine.rs       WorkflowEngineBuilder, WorkflowEngine, dispatch loop
 ├── worker.rs       WorkerTask — executes one workflow run end-to-end
 ├── metrics.rs      Optional metrics instrumentation (behind `metrics` feature)
@@ -741,6 +855,10 @@ The dispatch loop holds a `Semaphore` to bound concurrent workflow executions. E
 - **Graceful shutdown** — `EngineHandle::shutdown()` stops the dispatch loop and cron scheduler
 - **Structured logging** — `tracing` integration with `RUST_LOG` env filter
 - **Run status polling** — `engine.get_run_status(run_id)`
+- **Workflow result retrieval** — `engine.get_run_result(run_id)` / `engine.get_run_result_typed::<T>(run_id)` for reading completed workflow output
+- **Typed workflows and activities** — `TypedWorkflow` / `TypedActivity` traits with associated `Input`/`Output` types; blanket impls auto-bridge to the untyped traits
+- **Shared workflow state** — `ctx.set_shared_state(&vars)` propagates common data (trace IDs, user context) to all activities via `ctx.shared_state::<T>()`
+- **Typed convenience methods** — `execute_activity_typed`, `start_workflow_typed`, `get_run_result_typed` for compile-time type safety without manual serde
 - **Metrics** — optional Prometheus-compatible counters/gauges/histograms via `metrics` crate (feature-gated)
 
 ## Limitations and known gaps

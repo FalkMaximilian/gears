@@ -5,6 +5,7 @@ pub mod event;
 pub mod metrics;
 pub mod storage;
 pub mod traits;
+pub mod typed;
 pub(crate) mod worker;
 
 // Public re-exports for library users.
@@ -17,3 +18,4 @@ pub use traits::{
     Activity, ActivityFuture, RunFilter, RunInfo, RunRecord, RunStatus, ScheduleRecord,
     ScheduleStatus, Storage, Workflow, WorkflowFuture,
 };
+pub use typed::{TypedActivity, TypedActivityFuture, TypedWorkflow, TypedWorkflowFuture};

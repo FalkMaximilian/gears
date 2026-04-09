@@ -54,9 +54,10 @@ On engine startup, `list_running_workflows()` finds any in-progress runs and rep
 ### Key Modules
 
 - **`traits.rs`** — `Workflow`, `Activity`, `Storage` traits. All user-defined logic implements these.
+- **`typed.rs`** — `TypedWorkflow`, `TypedActivity` traits with associated `Input`/`Output` types. Blanket impls auto-generate the untyped `Workflow`/`Activity` implementations, handling serde at the boundary.
 - **`event.rs`** — `WorkflowEvent`/`EventPayload` enum — the immutable event log schema.
-- **`context.rs`** — `WorkflowContext` (passed to `Workflow::run`) provides `execute_activity()`, `execute_activities_parallel()`, `sleep()`/`sleep_until()`, `get_version()`, `register_cleanup()`, and cancellation support. Maintains internal replay cache keyed by call sequence number. Activities are looked up by name from the registry.
-- **`engine.rs`** — `WorkflowEngineBuilder` + `WorkflowEngine`. Manages workflow/activity registration, dispatch loop, recovery on startup, concurrency via semaphore, `cancel_workflow()`, and `list_runs()`.
+- **`context.rs`** — `WorkflowContext` (passed to `Workflow::run`) provides `execute_activity()`, `execute_activities_parallel()`, `sleep()`/`sleep_until()`, `get_version()`, `register_cleanup()`, cancellation support, and shared workflow state (`set_shared_state`/`shared_state`). `ActivityContext` carries run metadata and optional shared state from the workflow. Maintains internal replay cache keyed by call sequence number. Activities are looked up by name from the registry. Typed convenience methods (`execute_activity_typed`, etc.) wrap the Value-based API with auto-serde.
+- **`engine.rs`** — `WorkflowEngineBuilder` + `WorkflowEngine`. Manages workflow/activity registration, dispatch loop, recovery on startup, concurrency via semaphore, `cancel_workflow()`, `list_runs()`, and typed variants (`start_workflow_typed`, `get_run_result`, `get_run_result_typed`).
 - **`worker.rs`** — `WorkerTask` executes a single workflow run end-to-end. Runs registered cleanups (LIFO, failures tolerated) before writing `WorkflowCompleted` or `WorkflowCancelled`. Writes `WorkflowFailed` directly without cleanups.
 - **`storage/sqlite.rs`** — SQLite backend (WAL mode). Two tables: `workflow_runs` (metadata + status) and `workflow_events` (append-only event log).
 - **`metrics.rs`** — Optional metrics instrumentation behind the `metrics` Cargo feature.
