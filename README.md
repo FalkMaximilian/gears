@@ -385,13 +385,25 @@ impl Activity for CancelJobActivity {
 
 #### When cleanups run
 
-| Workflow outcome | Cleanups run? |
-|---|---|
-| Returned `Ok` — completed successfully | **Yes** |
-| Cancelled via `engine.cancel_workflow` | **Yes** |
-| Returned `Err` — workflow failed | **No** |
+| Workflow outcome | Default (`OnSuccessOrCancelled`) | `CleanupPolicy::Always` |
+|---|---|---|
+| Returned `Ok` — completed successfully | **Yes** | **Yes** |
+| Cancelled via `engine.cancel_workflow` | **Yes** | **Yes** |
+| Returned `Err` — workflow failed | **No** | **Yes** |
 
-Failures are excluded because they may be transient (e.g. the external API was temporarily unavailable, or a dependency timed out). Cleanup code typically cancels or releases resources that were intentionally acquired, which is only meaningful when the workflow reached a terminal state on purpose.
+The default policy excludes failures because they may be transient (e.g. the external API was temporarily unavailable, or a dependency timed out). Cleanup code typically cancels or releases resources that were intentionally acquired, which is only meaningful when the workflow reached a terminal state on purpose.
+
+Use `CleanupPolicy::Always` when your cleanup activities should run regardless of failure — for example, to release long-held locks or external resources that must be freed even if the workflow errored:
+
+```rust
+let mut engine = WorkflowEngine::builder()
+    .with_storage(storage)
+    .register_workflow(MyWorkflow)
+    .register_activity(MyCleanupActivity)
+    .cleanup_policy(CleanupPolicy::Always)
+    .build()
+    .await?;
+```
 
 #### Ordering
 
@@ -508,6 +520,9 @@ let flag = std::env::var("FEATURE_FLAG").unwrap_or_default();
 
 // ❌ Spawning tasks or threads — not tracked by the replay mechanism
 tokio::spawn(async { /* ... */ });
+
+// ❌ Logging or metrics that should only fire once — will repeat on every replay
+tracing::info!("workflow started");
 ```
 
 ### Wrap all non-determinism in activities instead
@@ -516,8 +531,41 @@ tokio::spawn(async { /* ... */ });
 // ✅ Any I/O or non-determinism goes through execute_activity
 let data = ctx.execute_activity("fetch_data", json!({"url": "..."})).await?;
 
-// ✅ If you need the current time, fetch it as an activity so it's recorded
-let now_str = ctx.execute_activity("get_current_time", json!({})).await?;
+// ✅ If you need the current time, use workflow_start_time() — deterministic across replay
+let started_at = ctx.workflow_start_time();
+let deadline = started_at + chrono::Duration::hours(24);
+
+// ✅ Gate one-shot side effects (logging, metrics) on is_replaying()
+if !ctx.is_replaying() {
+    tracing::info!("workflow started with fresh execution");
+}
+```
+
+### Determinism helpers
+
+`WorkflowContext` provides two helpers to make it easier to write correct workflow code:
+
+**`ctx.is_replaying() -> bool`**
+
+Returns `true` while the workflow is re-executing history to reconstruct its state (i.e., the current call will be served from the event cache without performing real I/O). Use this to skip side effects — logging, tracing, metrics — that should only fire on live execution, not on every replay.
+
+```rust
+if !ctx.is_replaying() {
+    metrics::increment_counter("workflow.started");
+}
+```
+
+**`ctx.workflow_start_time() -> DateTime<Utc>`**
+
+Returns the UTC timestamp at which this workflow run started. For recovered or replayed runs, this returns the original `WorkflowStarted` event timestamp — not the current wall clock time. This makes it safe to compute deadlines, elapsed time, or timeouts relative to the start time inside workflow logic.
+
+```rust
+// Safe to use inside a workflow — returns the same value on every replay.
+let started_at = ctx.workflow_start_time();
+let deadline = started_at + chrono::Duration::hours(24);
+if Utc::now() > deadline {
+    return Err(ZdflowError::Other("workflow exceeded 24h deadline".into()));
+}
 ```
 
 ### Branching on activity results is safe
@@ -555,7 +603,7 @@ Every state transition appends an immutable event. The full schema:
 | `CleanupCompleted` | A cleanup activity returned `Ok` |
 | `CleanupFailed` | A cleanup activity returned `Err` or was not registered |
 | `WorkflowCompleted` | Written after all cleanups finish; workflow returned `Ok` |
-| `WorkflowFailed` | Workflow returned `Err` (cleanups do not run) |
+| `WorkflowFailed` | Workflow returned `Err`; cleanups run first if `CleanupPolicy::Always` is set, otherwise skipped |
 | `WorkflowCancelled` | Written after all cleanups finish; workflow was cancelled |
 
 Each event carries a monotonic `sequence` (global position in the run's log) and a `sequence_id` (logical call index, shared between activities and timers, used as the replay key).
@@ -614,7 +662,8 @@ let mut engine = WorkflowEngine::builder()
     .with_storage(storage)
     .register_workflow(MyWorkflow)
     .register_activity(MyActivity)
-    .max_concurrent_workflows(100)  // default: 100
+    .max_concurrent_workflows(100)          // default: 100
+    .cleanup_policy(CleanupPolicy::Always)  // default: OnSuccessOrCancelled
     .build()
     .await?;
 
@@ -692,7 +741,8 @@ After `workflow.run` returns, registered cleanups are executed (where applicable
 |---|---|---|---|
 | `Ok(output)` | **Yes** | `WorkflowCompleted { output }` | `Completed` |
 | `Err(ZdflowError::Cancelled)` | **Yes** | `WorkflowCancelled { reason }` | `Cancelled` |
-| `Err(other)` | No | `WorkflowFailed { error }` | `Failed` |
+| `Err(other)` — default policy | No | `WorkflowFailed { error }` | `Failed` |
+| `Err(other)` — `CleanupPolicy::Always` | **Yes** | `WorkflowFailed { error }` | `Failed` |
 
 Cleanups run in LIFO order. Each cleanup writes a `CleanupCompleted` or `CleanupFailed` event; failures do not abort remaining cleanups or change the final status. The terminal event is only written after all cleanups have finished (or been skipped).
 
@@ -733,13 +783,19 @@ Emitted metrics:
 | Variant | When it occurs | What to do |
 |---|---|---|
 | `ActivityFailed(msg)` | Activity exhausted all retry attempts. The message is from the last attempt. | Propagates as `Err(...)` to the workflow; handle or let the workflow fail. |
+| `ActivityTimedOut { activity_name, timeout }` | An activity attempt exceeded its configured `timeout()`. Each timed-out attempt counts as a failure and may be retried. | Increase `timeout()`, reduce work per attempt, or handle in the workflow. |
 | `ActivityNotFound(name)` | `ctx.execute_activity("name", ...)` called but no activity with that name is registered. | Fix the name string or register the activity. |
 | `WorkflowNotFound(name)` | `engine.start_workflow("name", ...)` called with an unregistered name. | Fix the name string or register the workflow. |
+| `VersionConflict { change_id, stored, min, max }` | The stored version marker for `change_id` is outside `[min, max]`. The running code is too far ahead of or behind the persisted version. | Widen the `[min, max]` range in `get_version()` to include `stored`. |
+| `TaskPanicked(msg)` | A Tokio task spawned by `execute_activities_parallel` panicked. | Investigate the panic in the task. Prefer `?` over `unwrap` in activity code. |
+| `RunNotFound(run_id)` | `engine.cancel_workflow(run_id)` called but no active context exists for that ID (run already completed or was never started). | Check the run status before cancelling. |
+| `ScheduleNotFound(name)` | `pause_schedule` or `resume_schedule` called for an unknown schedule name. | Verify the schedule name or call `list_schedules()` to enumerate registered schedules. |
+| `InvalidSchedule(msg)` | An invalid cron expression was passed to `schedule_workflow`. | Fix the cron expression. Format: `sec min hour dom month dow`. |
 | `Cancelled` | `engine.cancel_workflow(run_id)` was called and propagated to the context. | Returned from `execute_activity` or `sleep`; the `WorkerTask` writes `WorkflowCancelled`. |
 | `EngineNotRunning` | `start_workflow` or `cancel_workflow` called before `engine.run()` or after shutdown. | Ensure the engine is running before submitting work. |
 | `Storage(e)` | A SQLite operation failed (I/O error, constraint violation). | Check disk space and file permissions. |
 | `Serialize(e)` | JSON serialization or deserialization of an event payload failed. | Check that activity inputs/outputs are JSON-serializable. |
-| `Other(msg)` | Miscellaneous: timer duration overflow, version incompatibility, task join error. | Read the message for specifics. |
+| `Other(msg)` | Unexpected errors: timer duration overflow, scheduler init failure. | Read the message for specifics; these indicate infrastructure problems. |
 
 **Activity errors are automatically retried** up to `max_attempts`. Only after all attempts are exhausted is `ActivityFailed` returned to the workflow.
 
@@ -847,7 +903,8 @@ The dispatch loop holds a `Semaphore` to bound concurrent workflow executions. E
 - **Versioning** — `ctx.get_version(change_id, min, max)` for safe workflow code changes with in-flight runs
 - **Crash recovery** — in-flight workflows detected and resumed on engine startup
 - **Workflow cancellation** — `engine.cancel_workflow(run_id)` cooperatively stops a running workflow
-- **Cleanup / Finalizers** — `ctx.register_cleanup(activity_name, input)` schedules cleanup activities that run on workflow success or cancellation (not failure); LIFO order; failures tolerated and recorded; crash-safe via `CleanupCompleted`/`CleanupFailed` events
+- **Cleanup / Finalizers** — `ctx.register_cleanup(activity_name, input)` schedules cleanup activities; configurable policy: `OnSuccessOrCancelled` (default) or `Always` (also runs on failure); LIFO order; failures tolerated and recorded; crash-safe via `CleanupCompleted`/`CleanupFailed` events
+- **Determinism helpers** — `ctx.is_replaying()` to gate one-shot side effects; `ctx.workflow_start_time()` for a stable, replay-safe start timestamp
 - **Run listing and search** — `engine.list_runs(filter)` with status, name, date range, and pagination
 - **Pluggable storage** — `Storage` trait; SQLite provided out of the box (WAL mode, bundled)
 - **Concurrency limit** — semaphore-based cap on simultaneous workflow executions
@@ -892,5 +949,5 @@ Scaling out across multiple processes or hosts would require adding a distribute
 - **Connection pool** — replace the single SQLite connection with a pool for higher write throughput
 - **Alternative storage backends** — PostgreSQL, Redis, or a distributed key-value store
 - **Overlap policy** — configurable overlap policy (e.g. skip if already running, queue, or allow parallel) per schedule
-- **Determinism checker** — a test-mode that re-executes workflows twice and panics on divergence, to catch non-determinism bugs early
+- **Determinism checker** — a test-mode that re-executes workflows twice and panics on divergence, to catch non-determinism bugs early (partial mitigation: `ctx.is_replaying()` and `ctx.workflow_start_time()` are available for safe workflow authoring)
 - **Snapshots / checkpoints** — persist intermediate workflow state to bound replay time for long-running workflows

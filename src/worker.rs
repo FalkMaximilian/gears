@@ -11,15 +11,27 @@ use crate::event::EventPayload;
 use crate::metrics;
 use crate::traits::{Activity, RunStatus, Storage, Workflow};
 
+/// Controls when registered cleanups are executed after a workflow run ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CleanupPolicy {
+    /// Run cleanups only when the workflow returns `Ok` or `Err(Cancelled)`.
+    /// Workflow failures (`Err(other)`) skip cleanups. This is the default.
+    #[default]
+    OnSuccessOrCancelled,
+    /// Run cleanups after any workflow outcome, including `Err(other)`.
+    Always,
+}
+
 /// Shared map of active workflow contexts, used for cancellation.
 type CancelHandles = Arc<Mutex<HashMap<Uuid, WorkflowContext>>>;
 
 /// Execute all registered cleanups that have not yet been completed or failed.
 ///
 /// This function is called by [`WorkerTask::run`] immediately after
-/// `Workflow::run` returns `Ok` or `Err(ZdflowError::Cancelled)`. It is
-/// **not** called on `Err(other)` — workflow failures are left alone because
-/// they may be transient and recoverable.
+/// `Workflow::run` returns `Ok` or `Err(ZdflowError::Cancelled)`, and also
+/// after `Err(other)` when [`CleanupPolicy::Always`] is configured. Under the
+/// default [`CleanupPolicy::OnSuccessOrCancelled`], workflow failures skip
+/// cleanups because they may be transient and recoverable.
 ///
 /// ## Ordering
 ///
@@ -169,6 +181,7 @@ pub(crate) struct WorkerTask {
     pub storage: Arc<dyn Storage>,
     pub history: Vec<crate::event::WorkflowEvent>,
     pub input: Value,
+    pub cleanup_policy: CleanupPolicy,
 }
 
 impl WorkerTask {
@@ -248,6 +261,10 @@ impl WorkerTask {
                 metrics::inc_workflow_cancelled(workflow_name);
             }
             Err(e) => {
+                if self.cleanup_policy == CleanupPolicy::Always {
+                    tracing::info!(run_id = %run_id, "workflow failed — running cleanups (policy=Always)");
+                    run_cleanups(run_id, &self.storage, &self.activities, &worker_ctx).await;
+                }
                 tracing::error!(run_id = %run_id, error = %e, "workflow failed");
                 let _ = worker_ctx
                     .append_event(EventPayload::WorkflowFailed {

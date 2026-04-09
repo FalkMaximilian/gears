@@ -6,11 +6,12 @@ pub mod metrics;
 pub mod storage;
 pub mod traits;
 pub mod typed;
-pub(crate) mod worker;
+pub mod worker;
 
 // Public re-exports for library users.
 pub use context::{ActivityContext, WorkflowContext};
 pub use engine::{EngineHandle, WorkflowEngine, WorkflowEngineBuilder};
+pub use worker::CleanupPolicy;
 pub use error::{Result, ZdflowError};
 pub use event::{EventPayload, WorkflowEvent};
 pub use storage::SqliteStorage;

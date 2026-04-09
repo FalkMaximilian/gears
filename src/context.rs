@@ -77,6 +77,13 @@ struct ContextInner {
     cancel_notify: tokio::sync::Notify,
     /// User-set shared state, accessible by all activities in this run.
     shared_state: Mutex<Option<Value>>,
+    /// One past the highest sequence_id of any completed history entry
+    /// (ActivityCompleted, ActivityErrored, TimerFired, CleanupRegistered).
+    /// Used by `is_replaying()`.
+    replay_depth: u32,
+    /// Timestamp of the WorkflowStarted event, or context-creation time for
+    /// brand-new runs. Used by `workflow_start_time()`.
+    workflow_start_time: DateTime<Utc>,
 }
 
 impl WorkflowContext {
@@ -89,6 +96,34 @@ impl WorkflowContext {
         // Find the max sequence already in history so we assign new
         // event sequences after all existing ones.
         let max_seq = history.iter().map(|e| e.sequence).max().unwrap_or(0);
+
+        // Compute how far into history is already complete so is_replaying()
+        // can return true while we're still serving cached results.
+        let replay_depth = history
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::ActivityCompleted { sequence_id, .. } => Some(sequence_id + 1),
+                EventPayload::ActivityErrored { sequence_id, .. } => Some(sequence_id + 1),
+                EventPayload::TimerFired { sequence_id } => Some(sequence_id + 1),
+                EventPayload::CleanupRegistered { sequence_id, .. } => Some(sequence_id + 1),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+
+        // Use the persisted start time for recovered runs; fall back to now
+        // for brand-new runs (WorkflowStarted hasn't been written yet).
+        let workflow_start_time = history
+            .iter()
+            .find_map(|e| {
+                if matches!(e.payload, EventPayload::WorkflowStarted { .. }) {
+                    Some(e.occurred_at)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(Utc::now);
+
         WorkflowContext {
             run_id,
             inner: Arc::new(ContextInner {
@@ -100,6 +135,8 @@ impl WorkflowContext {
                 cancelled: AtomicBool::new(false),
                 cancel_notify: tokio::sync::Notify::new(),
                 shared_state: Mutex::new(None),
+                replay_depth,
+                workflow_start_time,
             }),
         }
     }
@@ -112,6 +149,27 @@ impl WorkflowContext {
     /// Returns `true` if cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
         self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Returns `true` while the workflow is re-executing history to reconstruct
+    /// its state (i.e., the current call will be served from the event cache
+    /// without performing real I/O).
+    ///
+    /// Use this to skip side effects — logging, tracing, metrics — that should
+    /// only fire on live execution, not on replay. Do **not** use it to gate
+    /// calls to `execute_activity` or `sleep`; those are always safe to call
+    /// regardless of replay state.
+    pub fn is_replaying(&self) -> bool {
+        self.inner.call_counter.load(Ordering::SeqCst) < self.inner.replay_depth
+    }
+
+    /// Returns the UTC timestamp at which this workflow run started.
+    ///
+    /// On crash-recovery and replay this returns the original start time from
+    /// the persisted `WorkflowStarted` event, making it safe to use inside
+    /// workflow logic (e.g., computing deadlines relative to the start time).
+    pub fn workflow_start_time(&self) -> DateTime<Utc> {
+        self.inner.workflow_start_time
     }
 
     /// Request cancellation. Context methods will return
@@ -323,18 +381,16 @@ impl WorkflowContext {
                             match result {
                                 Ok(inner) => inner,
                                 Err(_elapsed) => {
-                                    let msg = format!(
-                                        "activity '{}' timed out after {:?}",
-                                        activity.name(),
-                                        duration
-                                    );
                                     self.append_event(EventPayload::ActivityAttemptTimedOut {
                                         sequence_id,
                                         attempt,
                                         timeout_ms: duration.as_millis() as u64,
                                     })
                                     .await?;
-                                    Err(ZdflowError::Other(msg))
+                                    Err(ZdflowError::ActivityTimedOut {
+                                        activity_name: activity.name().to_string(),
+                                        timeout: duration,
+                                    })
                                 }
                             }
                         }
@@ -442,7 +498,7 @@ impl WorkflowContext {
         for handle in handles {
             let result = handle
                 .await
-                .map_err(|e| ZdflowError::Other(format!("task join error: {e}")))?;
+                .map_err(|e| ZdflowError::TaskPanicked(e.to_string()))?;
             results.push(result?);
         }
         Ok(results)
@@ -566,10 +622,12 @@ impl WorkflowContext {
                 && cid == change_id
             {
                 if *version < min_version || *version > max_version {
-                    return Err(ZdflowError::Other(format!(
-                        "version incompatibility for '{}': stored={} range=[{}, {}]",
-                        change_id, version, min_version, max_version
-                    )));
+                    return Err(ZdflowError::VersionConflict {
+                        change_id: change_id.to_string(),
+                        stored: *version,
+                        min: min_version,
+                        max: max_version,
+                    });
                 }
                 return Ok(*version);
             }

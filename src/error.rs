@@ -1,4 +1,7 @@
+use std::time::Duration;
+
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum ZdflowError {
@@ -25,6 +28,38 @@ pub enum ZdflowError {
 
     #[error("engine not running")]
     EngineNotRunning,
+
+    /// An activity attempt exceeded its configured per-attempt timeout.
+    #[error("activity '{activity_name}' timed out after {timeout:?}")]
+    ActivityTimedOut {
+        activity_name: String,
+        timeout: Duration,
+    },
+
+    /// The stored version marker for `change_id` is outside `[min, max]`.
+    #[error("version incompatibility for '{change_id}': stored={stored} range=[{min}, {max}]")]
+    VersionConflict {
+        change_id: String,
+        stored: u32,
+        min: u32,
+        max: u32,
+    },
+
+    /// A tokio task spawned for parallel activity execution panicked.
+    #[error("parallel activity task panicked: {0}")]
+    TaskPanicked(String),
+
+    /// An invalid cron expression was passed to `schedule_workflow`.
+    #[error("invalid cron expression: {0}")]
+    InvalidSchedule(String),
+
+    /// `cancel_workflow` was called for a run ID with no active handle.
+    #[error("no active workflow run with id {0}")]
+    RunNotFound(Uuid),
+
+    /// `pause_schedule` or `resume_schedule` called for an unknown schedule.
+    #[error("schedule not found: '{0}'")]
+    ScheduleNotFound(String),
 
     #[error("{0}")]
     Other(String),

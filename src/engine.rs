@@ -15,7 +15,7 @@ use crate::metrics;
 use crate::traits::{
     Activity, RunFilter, RunInfo, RunStatus, ScheduleRecord, ScheduleStatus, Storage, Workflow,
 };
-use crate::worker::WorkerTask;
+use crate::worker::{CleanupPolicy, WorkerTask};
 
 // ── Internal message types ────────────────────────────────────────────────
 
@@ -35,6 +35,7 @@ pub struct WorkflowEngineBuilder {
     workflows: HashMap<String, Arc<dyn Workflow>>,
     activities: HashMap<String, Arc<dyn Activity>>,
     max_concurrent: usize,
+    cleanup_policy: CleanupPolicy,
 }
 
 impl Default for WorkflowEngineBuilder {
@@ -44,6 +45,7 @@ impl Default for WorkflowEngineBuilder {
             workflows: HashMap::new(),
             activities: HashMap::new(),
             max_concurrent: 100,
+            cleanup_policy: CleanupPolicy::default(),
         }
     }
 }
@@ -73,6 +75,16 @@ impl WorkflowEngineBuilder {
         self
     }
 
+    /// Set the cleanup policy for all workflows run by this engine.
+    ///
+    /// - [`CleanupPolicy::OnSuccessOrCancelled`] (default): cleanups run after
+    ///   `Ok` or `Err(Cancelled)` only.
+    /// - [`CleanupPolicy::Always`]: cleanups also run after `Err(other)`.
+    pub fn cleanup_policy(mut self, policy: CleanupPolicy) -> Self {
+        self.cleanup_policy = policy;
+        self
+    }
+
     pub async fn build(self) -> Result<WorkflowEngine> {
         let storage = self
             .storage
@@ -95,6 +107,7 @@ impl WorkflowEngineBuilder {
             cancel_handles: Arc::new(Mutex::new(HashMap::new())),
             job_scheduler,
             job_handles: Arc::new(Mutex::new(HashMap::new())),
+            cleanup_policy: self.cleanup_policy,
         })
     }
 }
@@ -113,6 +126,7 @@ pub struct WorkflowEngine {
     job_scheduler: Arc<Mutex<JobScheduler>>,
     /// Maps schedule name → scheduler job UUID (for pause/remove).
     job_handles: Arc<Mutex<HashMap<String, Uuid>>>,
+    cleanup_policy: CleanupPolicy,
 }
 
 impl WorkflowEngine {
@@ -142,7 +156,7 @@ impl WorkflowEngine {
         let start_rx = self
             .start_rx
             .take()
-            .expect("WorkflowEngine::run called twice");
+            .ok_or_else(|| ZdflowError::Other("WorkflowEngine::run() called twice".into()))?;
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -151,6 +165,7 @@ impl WorkflowEngine {
         let activities = self.activities.clone();
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent));
         let cancel_handles = self.cancel_handles.clone();
+        let cleanup_policy = self.cleanup_policy;
 
         tokio::spawn(dispatch_loop(
             start_rx,
@@ -160,6 +175,7 @@ impl WorkflowEngine {
             activities,
             semaphore,
             cancel_handles,
+            cleanup_policy,
         ));
 
         // Re-register all active schedules persisted from previous runs.
@@ -247,9 +263,7 @@ impl WorkflowEngine {
             tracing::info!(run_id = %run_id, "workflow cancellation requested");
             Ok(())
         } else {
-            Err(ZdflowError::Other(format!(
-                "no active workflow with run_id {run_id}"
-            )))
+            Err(ZdflowError::RunNotFound(run_id))
         }
     }
 
@@ -363,7 +377,7 @@ impl WorkflowEngine {
             .lock()
             .await
             .remove(name)
-            .ok_or_else(|| ZdflowError::Other(format!("no active schedule '{name}'")))?;
+            .ok_or_else(|| ZdflowError::ScheduleNotFound(name.to_string()))?;
         let _ = self.job_scheduler.lock().await.remove(&uuid).await;
         self.storage
             .set_schedule_status(name, ScheduleStatus::Paused)
@@ -385,7 +399,7 @@ impl WorkflowEngine {
             .storage
             .get_schedule(name)
             .await?
-            .ok_or_else(|| ZdflowError::Other(format!("schedule '{name}' not found")))?;
+            .ok_or_else(|| ZdflowError::ScheduleNotFound(name.to_string()))?;
 
         let job = build_scheduler_job(&record, self.start_tx.clone(), self.storage.clone())?;
         let job_uuid = self
@@ -410,6 +424,7 @@ impl WorkflowEngine {
 
 // ── Dispatch loop ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_loop(
     mut start_rx: mpsc::Receiver<StartRequest>,
     mut shutdown_rx: oneshot::Receiver<()>,
@@ -418,6 +433,7 @@ async fn dispatch_loop(
     activities: Arc<HashMap<String, Arc<dyn Activity>>>,
     semaphore: Arc<Semaphore>,
     cancel_handles: CancelHandles,
+    cleanup_policy: CleanupPolicy,
 ) {
     loop {
         tokio::select! {
@@ -443,7 +459,10 @@ async fn dispatch_loop(
                     }
                 };
 
-                let permit = semaphore.clone().acquire_owned().await.unwrap();
+                let Ok(permit) = semaphore.clone().acquire_owned().await else {
+                    tracing::error!("dispatch loop: semaphore closed, stopping");
+                    break;
+                };
                 let task = WorkerTask {
                     run_id: req.run_id,
                     workflow,
@@ -451,6 +470,7 @@ async fn dispatch_loop(
                     storage: storage.clone(),
                     history,
                     input: req.input,
+                    cleanup_policy,
                 };
 
                 let handles = cancel_handles.clone();
@@ -515,7 +535,7 @@ fn build_scheduler_job(
             tracing::info!(schedule = %name, %run_id, workflow = %workflow_name, "schedule fired");
         })
     })
-    .map_err(|e| ZdflowError::Other(format!("invalid cron expression: {e}")))
+    .map_err(|e| ZdflowError::InvalidSchedule(e.to_string()))
 }
 
 // ── EngineHandle ──────────────────────────────────────────────────────────

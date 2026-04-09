@@ -4,10 +4,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use std::sync::Arc;
+
 use zdflow::{
-    Activity, ActivityContext, ActivityFuture, RunFilter, RunStatus, SqliteStorage, TypedActivity,
-    TypedActivityFuture, TypedWorkflow, TypedWorkflowFuture, Workflow, WorkflowContext,
-    WorkflowEngine, WorkflowFuture, ZdflowError,
+    Activity, ActivityContext, ActivityFuture, CleanupPolicy, EventPayload, RunFilter, RunStatus,
+    SqliteStorage, Storage, TypedActivity, TypedActivityFuture, TypedWorkflow, TypedWorkflowFuture,
+    Workflow, WorkflowContext, WorkflowEngine, WorkflowEvent, WorkflowFuture, ZdflowError,
 };
 
 // ── Test activities ──────────────────────────────────────────────────────
@@ -548,3 +550,580 @@ async fn test_get_run_result_raw_json() {
 
     handle.shutdown().await;
 }
+
+// ── Cleanup infrastructure ────────────────────────────────────────────────
+
+type CallLog = Arc<std::sync::Mutex<Vec<String>>>;
+
+/// Activity that appends its name to a shared call log.
+struct LoggingActivity {
+    activity_name: &'static str,
+    log: CallLog,
+}
+
+impl Activity for LoggingActivity {
+    fn name(&self) -> &'static str {
+        self.activity_name
+    }
+
+    fn execute(&self, _ctx: ActivityContext, input: Value) -> ActivityFuture {
+        let log = self.log.clone();
+        let name = self.activity_name;
+        Box::pin(async move {
+            log.lock().unwrap().push(name.to_string());
+            Ok(input)
+        })
+    }
+
+    fn max_attempts(&self) -> u32 {
+        1
+    }
+}
+
+/// Activity that always returns an error (used as a failing cleanup).
+struct AlwaysFailCleanupActivity;
+
+impl Activity for AlwaysFailCleanupActivity {
+    fn name(&self) -> &'static str {
+        "always_fail_cleanup"
+    }
+
+    fn execute(&self, _ctx: ActivityContext, _input: Value) -> ActivityFuture {
+        Box::pin(async move {
+            Err(ZdflowError::Other("cleanup failed intentionally".into()))
+        })
+    }
+
+    fn max_attempts(&self) -> u32 {
+        1
+    }
+}
+
+// Registers one cleanup then completes successfully.
+struct CleanupSuccessWorkflow;
+
+impl Workflow for CleanupSuccessWorkflow {
+    fn name(&self) -> &'static str {
+        "cleanup_success_wf"
+    }
+
+    fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            ctx.register_cleanup("cleanup_action", json!({})).await?;
+            Ok(json!("success"))
+        })
+    }
+}
+
+// Registers one cleanup then fails (workflow-level error).
+struct CleanupFailureWorkflow;
+
+impl Workflow for CleanupFailureWorkflow {
+    fn name(&self) -> &'static str {
+        "cleanup_failure_wf"
+    }
+
+    fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            ctx.register_cleanup("cleanup_action", json!({})).await?;
+            Err(ZdflowError::Other("workflow failed intentionally".into()))
+        })
+    }
+}
+
+// Registers one cleanup then sleeps — used for cancellation tests.
+struct CleanupCancelWorkflow;
+
+impl Workflow for CleanupCancelWorkflow {
+    fn name(&self) -> &'static str {
+        "cleanup_cancel_wf"
+    }
+
+    fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            ctx.register_cleanup("cleanup_action", json!({})).await?;
+            ctx.sleep(Duration::from_secs(60)).await?;
+            Ok(json!("done"))
+        })
+    }
+}
+
+// Registers two cleanups in order — used to verify LIFO execution.
+struct MultiCleanupWorkflow;
+
+impl Workflow for MultiCleanupWorkflow {
+    fn name(&self) -> &'static str {
+        "multi_cleanup_wf"
+    }
+
+    fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            ctx.register_cleanup("cleanup_first", json!({"order": 1})).await?;
+            ctx.register_cleanup("cleanup_second", json!({"order": 2})).await?;
+            Ok(json!("done"))
+        })
+    }
+}
+
+// Registers a cleanup for an activity that always fails, then succeeds.
+struct CleanupFailingActivityWorkflow;
+
+impl Workflow for CleanupFailingActivityWorkflow {
+    fn name(&self) -> &'static str {
+        "cleanup_failing_activity_wf"
+    }
+
+    fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            ctx.register_cleanup("always_fail_cleanup", json!({})).await?;
+            Ok(json!("success"))
+        })
+    }
+}
+
+// Registers a cleanup for an activity that is not in the registry.
+struct UnregisteredCleanupWorkflow;
+
+impl Workflow for UnregisteredCleanupWorkflow {
+    fn name(&self) -> &'static str {
+        "unregistered_cleanup_wf"
+    }
+
+    fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            ctx.register_cleanup("nonexistent_activity_xyz", json!({})).await?;
+            Ok(json!("success"))
+        })
+    }
+}
+
+// Simple no-op workflow used by schedule and crash-recovery tests.
+struct NullWorkflow;
+
+impl Workflow for NullWorkflow {
+    fn name(&self) -> &'static str {
+        "null_wf"
+    }
+
+    fn run(&self, _ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
+        Box::pin(async move { Ok(json!("ok")) })
+    }
+}
+
+// Two sequential echo steps — used for crash recovery test.
+struct TwoStepWorkflow;
+
+impl Workflow for TwoStepWorkflow {
+    fn name(&self) -> &'static str {
+        "two_step_wf"
+    }
+
+    fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            let a = ctx
+                .execute_activity(EchoActivity::NAME, json!({"step": "a"}))
+                .await?;
+            let b = ctx
+                .execute_activity(EchoActivity::NAME, json!({"step": "b"}))
+                .await?;
+            Ok(json!({"a": a, "b": b}))
+        })
+    }
+}
+
+// ── Cleanup tests ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_cleanup_runs_on_success() {
+    let log: CallLog = Arc::new(std::sync::Mutex::new(vec![]));
+
+    let storage = SqliteStorage::open(":memory:").await.unwrap();
+    let mut engine = WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(CleanupSuccessWorkflow)
+        .register_activity(LoggingActivity {
+            activity_name: "cleanup_action",
+            log: log.clone(),
+        })
+        .build()
+        .await
+        .unwrap();
+
+    let handle = engine.run().await.unwrap();
+    let run_id = engine
+        .start_workflow("cleanup_success_wf", json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+    handle.shutdown().await;
+
+    let calls = log.lock().unwrap().clone();
+    assert_eq!(calls, vec!["cleanup_action"], "cleanup should run once on success");
+}
+
+#[tokio::test]
+async fn test_cleanup_lifo_order() {
+    let log: CallLog = Arc::new(std::sync::Mutex::new(vec![]));
+
+    let storage = SqliteStorage::open(":memory:").await.unwrap();
+    let mut engine = WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(MultiCleanupWorkflow)
+        .register_activity(LoggingActivity {
+            activity_name: "cleanup_first",
+            log: log.clone(),
+        })
+        .register_activity(LoggingActivity {
+            activity_name: "cleanup_second",
+            log: log.clone(),
+        })
+        .build()
+        .await
+        .unwrap();
+
+    let handle = engine.run().await.unwrap();
+    let run_id = engine
+        .start_workflow("multi_cleanup_wf", json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+    handle.shutdown().await;
+
+    let calls = log.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec!["cleanup_second", "cleanup_first"],
+        "cleanups must run in LIFO order (last registered runs first)"
+    );
+}
+
+#[tokio::test]
+async fn test_cleanup_runs_on_cancellation() {
+    let log: CallLog = Arc::new(std::sync::Mutex::new(vec![]));
+
+    let storage = SqliteStorage::open(":memory:").await.unwrap();
+    let mut engine = WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(CleanupCancelWorkflow)
+        .register_activity(LoggingActivity {
+            activity_name: "cleanup_action",
+            log: log.clone(),
+        })
+        .build()
+        .await
+        .unwrap();
+
+    let handle = engine.run().await.unwrap();
+    let run_id = engine
+        .start_workflow("cleanup_cancel_wf", json!({}))
+        .await
+        .unwrap();
+
+    // Give the workflow time to register the cleanup and enter the sleep.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    engine.cancel_workflow(run_id).await.unwrap();
+    wait_for_status(&engine, run_id, RunStatus::Cancelled).await;
+    handle.shutdown().await;
+
+    let calls = log.lock().unwrap().clone();
+    assert_eq!(calls, vec!["cleanup_action"], "cleanup should run on cancellation");
+}
+
+#[tokio::test]
+async fn test_cleanup_skipped_on_failure_default_policy() {
+    let log: CallLog = Arc::new(std::sync::Mutex::new(vec![]));
+
+    let storage = SqliteStorage::open(":memory:").await.unwrap();
+    let mut engine = WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(CleanupFailureWorkflow)
+        .register_activity(LoggingActivity {
+            activity_name: "cleanup_action",
+            log: log.clone(),
+        })
+        .build()
+        .await
+        .unwrap();
+
+    let handle = engine.run().await.unwrap();
+    let run_id = engine
+        .start_workflow("cleanup_failure_wf", json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&engine, run_id, RunStatus::Failed).await;
+    handle.shutdown().await;
+
+    let calls = log.lock().unwrap().clone();
+    assert!(
+        calls.is_empty(),
+        "cleanup must NOT run on workflow failure under default (OnSuccessOrCancelled) policy"
+    );
+}
+
+#[tokio::test]
+async fn test_cleanup_always_policy() {
+    let log: CallLog = Arc::new(std::sync::Mutex::new(vec![]));
+
+    let storage = SqliteStorage::open(":memory:").await.unwrap();
+    let mut engine = WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(CleanupFailureWorkflow)
+        .register_activity(LoggingActivity {
+            activity_name: "cleanup_action",
+            log: log.clone(),
+        })
+        .cleanup_policy(CleanupPolicy::Always)
+        .build()
+        .await
+        .unwrap();
+
+    let handle = engine.run().await.unwrap();
+    let run_id = engine
+        .start_workflow("cleanup_failure_wf", json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&engine, run_id, RunStatus::Failed).await;
+    handle.shutdown().await;
+
+    let calls = log.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec!["cleanup_action"],
+        "cleanup should run on failure when CleanupPolicy::Always is set"
+    );
+}
+
+#[tokio::test]
+async fn test_cleanup_failure_tolerated() {
+    let storage = SqliteStorage::open(":memory:").await.unwrap();
+    let mut engine = WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(CleanupFailingActivityWorkflow)
+        .register_activity(AlwaysFailCleanupActivity)
+        .build()
+        .await
+        .unwrap();
+
+    let handle = engine.run().await.unwrap();
+    let run_id = engine
+        .start_workflow("cleanup_failing_activity_wf", json!({}))
+        .await
+        .unwrap();
+    // A failing cleanup must not change the workflow's final status.
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_cleanup_unregistered_activity_tolerated() {
+    let storage = SqliteStorage::open(":memory:").await.unwrap();
+    let mut engine = WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(UnregisteredCleanupWorkflow)
+        // Deliberately NOT registering "nonexistent_activity_xyz".
+        .build()
+        .await
+        .unwrap();
+
+    let handle = engine.run().await.unwrap();
+    let run_id = engine
+        .start_workflow("unregistered_cleanup_wf", json!({}))
+        .await
+        .unwrap();
+    // A missing cleanup activity must not fail the workflow.
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+    handle.shutdown().await;
+}
+
+// ── Schedule tests ────────────────────────────────────────────────────────
+
+async fn build_schedule_engine() -> WorkflowEngine {
+    let storage = SqliteStorage::open(":memory:").await.unwrap();
+    WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(NullWorkflow)
+        .register_workflow(SimpleWorkflow)
+        .register_activity(EchoActivity)
+        .build()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_invalid_cron_expression() {
+    let mut engine = build_schedule_engine().await;
+    let _handle = engine.run().await.unwrap();
+
+    let err = engine
+        .schedule_workflow("bad-sched", "not a cron expression", "null_wf", json!({}))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ZdflowError::InvalidSchedule(_)),
+        "expected InvalidSchedule error, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_schedule_list_and_delete() {
+    let mut engine = build_schedule_engine().await;
+    let handle = engine.run().await.unwrap();
+
+    // Far-future schedules so they never fire during the test.
+    engine
+        .schedule_workflow("sched-alpha", "0 0 0 1 1 *", "null_wf", json!({}))
+        .await
+        .unwrap();
+    engine
+        .schedule_workflow("sched-beta", "0 0 0 1 1 *", "null_wf", json!({}))
+        .await
+        .unwrap();
+
+    let schedules = engine.list_schedules().await.unwrap();
+    assert_eq!(schedules.len(), 2);
+    assert!(schedules.iter().any(|s| s.name == "sched-alpha"));
+    assert!(schedules.iter().any(|s| s.name == "sched-beta"));
+
+    engine.delete_schedule("sched-alpha").await.unwrap();
+    let schedules = engine.list_schedules().await.unwrap();
+    assert_eq!(schedules.len(), 1);
+    assert_eq!(schedules[0].name, "sched-beta");
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_schedule_fires() {
+    let mut engine = build_schedule_engine().await;
+    let handle = engine.run().await.unwrap();
+
+    // `"* * * * * *"` fires every second on each second boundary.
+    engine
+        .schedule_workflow("tick", "* * * * * *", "null_wf", json!({}))
+        .await
+        .unwrap();
+
+    // Wait long enough for at least one tick.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let runs = engine
+        .list_runs(&RunFilter {
+            workflow_name: Some("null_wf".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        !runs.is_empty(),
+        "schedule should have triggered at least one workflow run"
+    );
+
+    handle.shutdown().await;
+}
+
+// ── Crash recovery test ───────────────────────────────────────────────────
+
+/// Validates that the engine correctly replays a partially-executed run after
+/// a simulated crash.  The test pre-populates a SQLite database with history
+/// showing that step A of a two-step workflow completed, then starts a fresh
+/// engine against the same file.  The engine must replay step A from history
+/// (without re-executing the activity) and execute step B live.
+#[tokio::test]
+async fn test_crash_recovery() {
+    let db_path = format!("/tmp/zdflow-crash-recovery-{}.db", Uuid::new_v4());
+    let run_id = Uuid::new_v4();
+
+    // Phase 1: Pre-populate the DB to simulate a crashed run where step A
+    // completed but step B has not started yet.
+    {
+        let storage = SqliteStorage::open(&db_path).await.unwrap();
+        storage
+            .create_run(run_id, "two_step_wf", &json!({}))
+            .await
+            .unwrap();
+
+        storage
+            .append_event(
+                run_id,
+                &WorkflowEvent {
+                    sequence: 0,
+                    occurred_at: chrono::Utc::now(),
+                    payload: EventPayload::WorkflowStarted {
+                        workflow_name: "two_step_wf".to_string(),
+                        input: json!({}),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        storage
+            .append_event(
+                run_id,
+                &WorkflowEvent {
+                    sequence: 1,
+                    occurred_at: chrono::Utc::now(),
+                    payload: EventPayload::ActivityScheduled {
+                        sequence_id: 0,
+                        activity_name: EchoActivity::NAME.to_string(),
+                        input: json!({"step": "a"}),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        storage
+            .append_event(
+                run_id,
+                &WorkflowEvent {
+                    sequence: 2,
+                    occurred_at: chrono::Utc::now(),
+                    payload: EventPayload::ActivityCompleted {
+                        sequence_id: 0,
+                        output: json!({"step": "a"}),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        // Run status stays "running" — simulates the process dying mid-flight.
+    }
+
+    // Phase 2: Start a fresh engine against the same file.  Track how many
+    // times the activity actually executes (replay must skip step A).
+    let call_log: CallLog = Arc::new(std::sync::Mutex::new(vec![]));
+
+    let storage = SqliteStorage::open(&db_path).await.unwrap();
+    let mut engine = WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(TwoStepWorkflow)
+        .register_activity(LoggingActivity {
+            activity_name: EchoActivity::NAME,
+            log: call_log.clone(),
+        })
+        .build()
+        .await
+        .unwrap();
+
+    let handle = engine.run().await.unwrap();
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+    handle.shutdown().await;
+
+    // Step A was in history: activity must NOT have been called for it.
+    // Step B was not in history: activity must have been called exactly once.
+    let calls = call_log.lock().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "EchoActivity should execute once (step B only); \
+         step A was in history and must be replayed without calling the activity"
+    );
+
+    let result = engine.get_run_result(run_id).await.unwrap().unwrap();
+    assert_eq!(result["a"], json!({"step": "a"}), "step A result must come from history");
+    assert_eq!(result["b"], json!({"step": "b"}), "step B result must come from live execution");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
