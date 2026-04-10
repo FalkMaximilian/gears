@@ -175,6 +175,95 @@ impl Workflow for ParallelWorkflow {
     }
 }
 
+// Workflow that uses execute_activities_parallel with a failing activity.
+// Used to verify fail-fast behaviour.
+struct ParallelFailFastWorkflow;
+
+impl ParallelFailFastWorkflow {
+    pub const NAME: &'static str = "parallel_fail_fast";
+}
+
+impl Workflow for ParallelFailFastWorkflow {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            ctx.execute_activities_parallel(vec![
+                (EchoActivity::NAME, json!({"id": 1})),
+                (FailActivity::NAME, json!({})),
+                (EchoActivity::NAME, json!({"id": 3})),
+            ])
+            .await?;
+            Ok(json!("done"))
+        })
+    }
+}
+
+// Workflow that uses try_execute_activities_parallel and reports partial results.
+struct TryParallelWorkflow;
+
+impl TryParallelWorkflow {
+    pub const NAME: &'static str = "try_parallel";
+}
+
+impl Workflow for TryParallelWorkflow {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            let results = ctx
+                .try_execute_activities_parallel(vec![
+                    (EchoActivity::NAME, json!({"id": 1})),
+                    (FailActivity::NAME, json!({})),
+                    (EchoActivity::NAME, json!({"id": 3})),
+                ])
+                .await?;
+            let successes = results.iter().filter(|r| r.is_ok()).count() as u32;
+            let failures = results.iter().filter(|r| r.is_err()).count() as u32;
+            Ok(json!({"successes": successes, "failures": failures}))
+        })
+    }
+}
+
+// Types and workflow for the heterogeneous typed-tuple test.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersonData {
+    name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ScoreData {
+    score: u32,
+}
+
+struct HeterogeneousWorkflow;
+
+impl HeterogeneousWorkflow {
+    pub const NAME: &'static str = "heterogeneous";
+}
+
+impl Workflow for HeterogeneousWorkflow {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            let (person, score): (PersonData, ScoreData) = ctx
+                .execute_activities_parallel_2(
+                    (EchoActivity::NAME, json!({"name": "Alice"})),
+                    (EchoActivity::NAME, json!({"score": 42u32})),
+                )
+                .await?;
+            Ok(json!({"name": person.name, "score": score.score}))
+        })
+    }
+}
+
 struct VersionedWorkflow;
 
 impl VersionedWorkflow {
@@ -213,6 +302,9 @@ async fn build_engine() -> WorkflowEngine {
         .register_workflow(TimeoutWorkflow)
         .register_workflow(SleepyWorkflow)
         .register_workflow(ParallelWorkflow)
+        .register_workflow(ParallelFailFastWorkflow)
+        .register_workflow(TryParallelWorkflow)
+        .register_workflow(HeterogeneousWorkflow)
         .register_workflow(VersionedWorkflow)
         .register_activity(EchoActivity)
         .register_activity(FailActivity)
@@ -1127,3 +1219,61 @@ async fn test_crash_recovery() {
     let _ = std::fs::remove_file(&db_path);
 }
 
+// ── Parallel activity improvement tests ───────────────────────────────────
+
+/// When one activity in execute_activities_parallel fails, the whole call
+/// should fail and the workflow should end with Failed status.
+#[tokio::test]
+async fn test_parallel_fail_fast() {
+    let mut engine = build_engine().await;
+    let handle = engine.run().await.unwrap();
+
+    let run_id = engine
+        .start_workflow(ParallelFailFastWorkflow::NAME, json!({}))
+        .await
+        .unwrap();
+
+    wait_for_status(&engine, run_id, RunStatus::Failed).await;
+    handle.shutdown().await;
+}
+
+/// try_execute_activities_parallel collects all results without short-circuiting.
+/// The workflow itself completes successfully and can inspect per-activity outcomes.
+#[tokio::test]
+async fn test_try_parallel_partial_results() {
+    let mut engine = build_engine().await;
+    let handle = engine.run().await.unwrap();
+
+    let run_id = engine
+        .start_workflow(TryParallelWorkflow::NAME, json!({}))
+        .await
+        .unwrap();
+
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+
+    let result = engine.get_run_result(run_id).await.unwrap().unwrap();
+    assert_eq!(result["successes"], 2, "two echo activities should succeed");
+    assert_eq!(result["failures"], 1, "one fail activity should fail");
+
+    handle.shutdown().await;
+}
+
+/// execute_activities_parallel_2 returns a typed tuple with different output types.
+#[tokio::test]
+async fn test_parallel_heterogeneous_types() {
+    let mut engine = build_engine().await;
+    let handle = engine.run().await.unwrap();
+
+    let run_id = engine
+        .start_workflow(HeterogeneousWorkflow::NAME, json!({}))
+        .await
+        .unwrap();
+
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+
+    let result = engine.get_run_result(run_id).await.unwrap().unwrap();
+    assert_eq!(result["name"], "Alice");
+    assert_eq!(result["score"], 42);
+
+    handle.shutdown().await;
+}

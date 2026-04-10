@@ -3,6 +3,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
+use tokio::task::JoinSet;
+
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -262,6 +264,139 @@ impl WorkflowContext {
             .collect()
     }
 
+    /// Execute multiple activities in parallel and collect *all* results,
+    /// including per-activity failures. Unlike
+    /// [`execute_activities_parallel`](Self::execute_activities_parallel),
+    /// this does not short-circuit on the first error — every activity runs
+    /// to completion (or exhausted retries).
+    ///
+    /// Returns `Err` only for unexpected task panics (`TaskPanicked`).
+    /// Per-activity failures are returned as `Err` items inside the `Vec`.
+    pub async fn try_execute_activities_parallel(
+        &self,
+        activities: Vec<(&str, Value)>,
+    ) -> Result<Vec<Result<Value>>> {
+        let n = activities.len();
+        let base = self.inner.call_counter.fetch_add(n as u32, Ordering::SeqCst);
+
+        let mut set: JoinSet<(usize, Result<Value>)> = JoinSet::new();
+        for (i, (activity_name, input)) in activities.into_iter().enumerate() {
+            let sequence_id = base + i as u32;
+            let activity = self
+                .inner
+                .activities
+                .get(activity_name)
+                .ok_or_else(|| ZdflowError::ActivityNotFound(activity_name.to_string()))?
+                .clone();
+            let ctx = self.clone();
+            set.spawn(async move {
+                let result = ctx.execute_activity_inner(&*activity, input, sequence_id).await;
+                (i, result)
+            });
+        }
+
+        let mut results: Vec<Option<Result<Value>>> = (0..n).map(|_| None).collect();
+        while let Some(join_res) = set.join_next().await {
+            match join_res {
+                Ok((i, result)) => results[i] = Some(result),
+                Err(e) => return Err(ZdflowError::TaskPanicked(e.to_string())),
+            }
+        }
+        Ok(results.into_iter().map(|r| r.unwrap()).collect())
+    }
+
+    /// Execute multiple activities in parallel and collect all results,
+    /// deserializing successes into `O`. Per-activity failures are returned
+    /// as `Err` items inside the `Vec`.
+    ///
+    /// This is a typed wrapper around
+    /// [`try_execute_activities_parallel`](Self::try_execute_activities_parallel).
+    pub async fn try_execute_activities_parallel_typed<O: DeserializeOwned>(
+        &self,
+        activities: Vec<(&str, Value)>,
+    ) -> Result<Vec<Result<O>>> {
+        let results = self.try_execute_activities_parallel(activities).await?;
+        Ok(results
+            .into_iter()
+            .map(|r| r.and_then(|v| serde_json::from_value(v).map_err(Into::into)))
+            .collect())
+    }
+
+    /// Execute exactly 2 activities in parallel, returning a typed tuple.
+    ///
+    /// Sequence IDs are pre-allocated to ensure deterministic replay.
+    /// If either activity fails, the other is aborted and the error is returned.
+    pub async fn execute_activities_parallel_2<O1, O2>(
+        &self,
+        a1: (&str, Value),
+        a2: (&str, Value),
+    ) -> Result<(O1, O2)>
+    where
+        O1: DeserializeOwned,
+        O2: DeserializeOwned,
+    {
+        let mut r = self.execute_activities_parallel(vec![a1, a2]).await?;
+        let v2 = r.pop().unwrap();
+        let v1 = r.pop().unwrap();
+        Ok((serde_json::from_value(v1)?, serde_json::from_value(v2)?))
+    }
+
+    /// Execute exactly 3 activities in parallel, returning a typed tuple.
+    ///
+    /// Sequence IDs are pre-allocated to ensure deterministic replay.
+    /// If any activity fails, the others are aborted and the error is returned.
+    pub async fn execute_activities_parallel_3<O1, O2, O3>(
+        &self,
+        a1: (&str, Value),
+        a2: (&str, Value),
+        a3: (&str, Value),
+    ) -> Result<(O1, O2, O3)>
+    where
+        O1: DeserializeOwned,
+        O2: DeserializeOwned,
+        O3: DeserializeOwned,
+    {
+        let mut r = self.execute_activities_parallel(vec![a1, a2, a3]).await?;
+        let v3 = r.pop().unwrap();
+        let v2 = r.pop().unwrap();
+        let v1 = r.pop().unwrap();
+        Ok((
+            serde_json::from_value(v1)?,
+            serde_json::from_value(v2)?,
+            serde_json::from_value(v3)?,
+        ))
+    }
+
+    /// Execute exactly 4 activities in parallel, returning a typed tuple.
+    ///
+    /// Sequence IDs are pre-allocated to ensure deterministic replay.
+    /// If any activity fails, the others are aborted and the error is returned.
+    pub async fn execute_activities_parallel_4<O1, O2, O3, O4>(
+        &self,
+        a1: (&str, Value),
+        a2: (&str, Value),
+        a3: (&str, Value),
+        a4: (&str, Value),
+    ) -> Result<(O1, O2, O3, O4)>
+    where
+        O1: DeserializeOwned,
+        O2: DeserializeOwned,
+        O3: DeserializeOwned,
+        O4: DeserializeOwned,
+    {
+        let mut r = self.execute_activities_parallel(vec![a1, a2, a3, a4]).await?;
+        let v4 = r.pop().unwrap();
+        let v3 = r.pop().unwrap();
+        let v2 = r.pop().unwrap();
+        let v1 = r.pop().unwrap();
+        Ok((
+            serde_json::from_value(v1)?,
+            serde_json::from_value(v2)?,
+            serde_json::from_value(v3)?,
+            serde_json::from_value(v4)?,
+        ))
+    }
+
     /// Register a cleanup activity with a typed input.
     ///
     /// This is a typed wrapper around [`register_cleanup`](Self::register_cleanup).
@@ -469,16 +604,18 @@ impl WorkflowContext {
     /// same order as the input. Sequence IDs are pre-allocated to ensure
     /// deterministic replay.
     ///
-    /// If any activity fails, remaining in-flight activities are cancelled
-    /// and the first error is returned.
+    /// If any activity fails, the remaining in-flight activities are aborted
+    /// and the first error is returned. Use
+    /// [`try_execute_activities_parallel`](Self::try_execute_activities_parallel)
+    /// to collect all results including failures.
     pub async fn execute_activities_parallel(
         &self,
         activities: Vec<(&str, Value)>,
     ) -> Result<Vec<Value>> {
-        let n = activities.len() as u32;
-        let base = self.inner.call_counter.fetch_add(n, Ordering::SeqCst);
+        let n = activities.len();
+        let base = self.inner.call_counter.fetch_add(n as u32, Ordering::SeqCst);
 
-        let mut handles = Vec::with_capacity(activities.len());
+        let mut set: JoinSet<(usize, Result<Value>)> = JoinSet::new();
         for (i, (activity_name, input)) in activities.into_iter().enumerate() {
             let sequence_id = base + i as u32;
             let activity = self
@@ -488,18 +625,25 @@ impl WorkflowContext {
                 .ok_or_else(|| ZdflowError::ActivityNotFound(activity_name.to_string()))?
                 .clone();
             let ctx = self.clone();
-            handles.push(tokio::spawn(async move {
-                ctx.execute_activity_inner(&*activity, input, sequence_id)
-                    .await
-            }));
+            set.spawn(async move {
+                let result = ctx.execute_activity_inner(&*activity, input, sequence_id).await;
+                (i, result)
+            });
         }
 
-        let mut results = Vec::with_capacity(handles.len());
-        for handle in handles {
-            let result = handle
-                .await
-                .map_err(|e| ZdflowError::TaskPanicked(e.to_string()))?;
-            results.push(result?);
+        let mut results = vec![Value::Null; n];
+        while let Some(join_res) = set.join_next().await {
+            match join_res {
+                Ok((i, Ok(v))) => results[i] = v,
+                Ok((_, Err(e))) => {
+                    set.abort_all();
+                    return Err(e);
+                }
+                Err(e) => {
+                    set.abort_all();
+                    return Err(ZdflowError::TaskPanicked(e.to_string()));
+                }
+            }
         }
         Ok(results)
     }
