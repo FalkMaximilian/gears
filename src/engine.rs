@@ -10,7 +10,7 @@ use tokio_cron_scheduler::{Job, JobScheduler};
 use uuid::Uuid;
 
 use crate::context::WorkflowContext;
-use crate::error::{Result, ZdflowError};
+use crate::error::{Result, GearsError};
 use crate::metrics;
 use crate::traits::{
     Activity, RunFilter, RunInfo, RunStatus, ScheduleRecord, ScheduleStatus, Storage, Workflow,
@@ -88,13 +88,13 @@ impl WorkflowEngineBuilder {
     pub async fn build(self) -> Result<WorkflowEngine> {
         let storage = self
             .storage
-            .ok_or_else(|| ZdflowError::Other("storage not configured".into()))?;
+            .ok_or_else(|| GearsError::Other("storage not configured".into()))?;
 
         let (start_tx, start_rx) = mpsc::channel::<StartRequest>(1024);
 
         let job_scheduler =
             Arc::new(Mutex::new(JobScheduler::new().await.map_err(|e| {
-                ZdflowError::Other(format!("scheduler init failed: {e}"))
+                GearsError::Other(format!("scheduler init failed: {e}"))
             })?));
 
         Ok(WorkflowEngine {
@@ -150,13 +150,13 @@ impl WorkflowEngine {
                     input: record.input,
                 })
                 .await
-                .map_err(|_| ZdflowError::EngineNotRunning)?;
+                .map_err(|_| GearsError::EngineNotRunning)?;
         }
 
         let start_rx = self
             .start_rx
             .take()
-            .ok_or_else(|| ZdflowError::Other("WorkflowEngine::run() called twice".into()))?;
+            .ok_or_else(|| GearsError::Other("WorkflowEngine::run() called twice".into()))?;
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -199,7 +199,7 @@ impl WorkflowEngine {
                     .await
                     .add(job)
                     .await
-                    .map_err(|e| ZdflowError::Other(format!("failed to add job: {e}")))?;
+                    .map_err(|e| GearsError::Other(format!("failed to add job: {e}")))?;
                 handles.insert(schedule.name.clone(), job_uuid);
                 tracing::info!(schedule = %schedule.name, "schedule recovered");
             }
@@ -210,7 +210,7 @@ impl WorkflowEngine {
             .await
             .start()
             .await
-            .map_err(|e| ZdflowError::Other(format!("scheduler start failed: {e}")))?;
+            .map_err(|e| GearsError::Other(format!("scheduler start failed: {e}")))?;
 
         Ok(EngineHandle {
             shutdown_tx,
@@ -222,7 +222,7 @@ impl WorkflowEngine {
     /// execution is asynchronous.
     pub async fn start_workflow(&self, workflow_name: &str, input: Value) -> Result<Uuid> {
         if !self.workflows.contains_key(workflow_name) {
-            return Err(ZdflowError::WorkflowNotFound(workflow_name.to_string()));
+            return Err(GearsError::WorkflowNotFound(workflow_name.to_string()));
         }
 
         let run_id = Uuid::new_v4();
@@ -237,7 +237,7 @@ impl WorkflowEngine {
                 input,
             })
             .await
-            .map_err(|_| ZdflowError::EngineNotRunning)?;
+            .map_err(|_| GearsError::EngineNotRunning)?;
 
         tracing::info!(run_id = %run_id, workflow = workflow_name, "workflow enqueued");
         metrics::inc_workflow_started(workflow_name);
@@ -255,7 +255,7 @@ impl WorkflowEngine {
     }
 
     /// Cancel a running workflow. The workflow's context methods will
-    /// return `ZdflowError::Cancelled` at the next yield point.
+    /// return `GearsError::Cancelled` at the next yield point.
     pub async fn cancel_workflow(&self, run_id: Uuid) -> Result<()> {
         let handles = self.cancel_handles.lock().await;
         if let Some(ctx) = handles.get(&run_id) {
@@ -263,7 +263,7 @@ impl WorkflowEngine {
             tracing::info!(run_id = %run_id, "workflow cancellation requested");
             Ok(())
         } else {
-            Err(ZdflowError::RunNotFound(run_id))
+            Err(GearsError::RunNotFound(run_id))
         }
     }
 
@@ -313,7 +313,7 @@ impl WorkflowEngine {
         input: Value,
     ) -> Result<()> {
         if !self.workflows.contains_key(workflow_name) {
-            return Err(ZdflowError::WorkflowNotFound(workflow_name.to_string()));
+            return Err(GearsError::WorkflowNotFound(workflow_name.to_string()));
         }
 
         // Remove any existing job for this schedule name.
@@ -338,7 +338,7 @@ impl WorkflowEngine {
             .await
             .add(job)
             .await
-            .map_err(|e| ZdflowError::Other(format!("failed to add scheduled job: {e}")))?;
+            .map_err(|e| GearsError::Other(format!("failed to add scheduled job: {e}")))?;
 
         self.job_handles
             .lock()
@@ -377,7 +377,7 @@ impl WorkflowEngine {
             .lock()
             .await
             .remove(name)
-            .ok_or_else(|| ZdflowError::ScheduleNotFound(name.to_string()))?;
+            .ok_or_else(|| GearsError::ScheduleNotFound(name.to_string()))?;
         let _ = self.job_scheduler.lock().await.remove(&uuid).await;
         self.storage
             .set_schedule_status(name, ScheduleStatus::Paused)
@@ -399,7 +399,7 @@ impl WorkflowEngine {
             .storage
             .get_schedule(name)
             .await?
-            .ok_or_else(|| ZdflowError::ScheduleNotFound(name.to_string()))?;
+            .ok_or_else(|| GearsError::ScheduleNotFound(name.to_string()))?;
 
         let job = build_scheduler_job(&record, self.start_tx.clone(), self.storage.clone())?;
         let job_uuid = self
@@ -408,7 +408,7 @@ impl WorkflowEngine {
             .await
             .add(job)
             .await
-            .map_err(|e| ZdflowError::Other(format!("failed to add scheduled job: {e}")))?;
+            .map_err(|e| GearsError::Other(format!("failed to add scheduled job: {e}")))?;
 
         self.job_handles
             .lock()
@@ -535,7 +535,7 @@ fn build_scheduler_job(
             tracing::info!(schedule = %name, %run_id, workflow = %workflow_name, "schedule fired");
         })
     })
-    .map_err(|e| ZdflowError::InvalidSchedule(e.to_string()))
+    .map_err(|e| GearsError::InvalidSchedule(e.to_string()))
 }
 
 // ── EngineHandle ──────────────────────────────────────────────────────────

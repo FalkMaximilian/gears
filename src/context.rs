@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::error::{Result, ZdflowError};
+use crate::error::{Result, GearsError};
 use crate::event::{EventPayload, WorkflowEvent};
 use crate::metrics;
 use crate::traits::{Activity, Storage};
@@ -27,7 +27,7 @@ use std::collections::HashMap;
 /// Each call to `concurrently` (and typed variants) reserves this many IDs for
 /// each branch it spawns. A branch that performs more than `BRANCH_BUDGET`
 /// total operations (activities, sleeps, nested `concurrently` forks) will
-/// return [`ZdflowError::BranchBudgetExceeded`].
+/// return [`GearsError::BranchBudgetExceeded`].
 ///
 /// **Nested `concurrently` within a branch**: each inner fork claims
 /// `1 + n × BRANCH_BUDGET` IDs from the outer branch's budget, so deep
@@ -48,7 +48,7 @@ pub type BranchFn = Box<dyn FnOnce(WorkflowContext) -> BranchFuture + Send + 'st
 /// # Example
 ///
 /// ```rust,ignore
-/// use zdflow::{branch, WorkflowContext};
+/// use gears::{branch, WorkflowContext};
 ///
 /// let results = ctx.concurrently(vec![
 ///     branch(|ctx| async move {
@@ -93,7 +93,7 @@ impl ActivityContext {
     pub fn shared_state<T: DeserializeOwned>(&self) -> Result<T> {
         match &self.shared_state {
             Some(v) => Ok(serde_json::from_value(v.clone())?),
-            None => Err(ZdflowError::Other(
+            None => Err(GearsError::Other(
                 "no shared state has been set on this workflow".into(),
             )),
         }
@@ -242,7 +242,7 @@ impl WorkflowContext {
     }
 
     /// Request cancellation. Context methods will return
-    /// `ZdflowError::Cancelled` at the next yield point.
+    /// `GearsError::Cancelled` at the next yield point.
     pub(crate) fn cancel(&self) {
         self.inner.cancelled.store(true, Ordering::SeqCst);
         self.inner.cancel_notify.notify_waiters();
@@ -250,7 +250,7 @@ impl WorkflowContext {
 
     fn check_cancelled(&self) -> Result<()> {
         if self.is_cancelled() {
-            Err(ZdflowError::Cancelled)
+            Err(GearsError::Cancelled)
         } else {
             Ok(())
         }
@@ -265,7 +265,7 @@ impl WorkflowContext {
             Some(counter) => {
                 let local = counter.fetch_add(1, Ordering::SeqCst);
                 if local >= BRANCH_BUDGET {
-                    return Err(ZdflowError::BranchBudgetExceeded {
+                    return Err(GearsError::BranchBudgetExceeded {
                         budget: BRANCH_BUDGET,
                     });
                 }
@@ -282,7 +282,7 @@ impl WorkflowContext {
             Some(counter) => {
                 let local = counter.fetch_add(n, Ordering::SeqCst);
                 if local.checked_add(n).map(|sum| sum > BRANCH_BUDGET).unwrap_or(true) {
-                    return Err(ZdflowError::BranchBudgetExceeded {
+                    return Err(GearsError::BranchBudgetExceeded {
                         budget: BRANCH_BUDGET,
                     });
                 }
@@ -356,7 +356,7 @@ impl WorkflowContext {
         let guard = self.inner.shared_state.lock().unwrap();
         match &*guard {
             Some(v) => Ok(serde_json::from_value(v.clone())?),
-            None => Err(ZdflowError::Other(
+            None => Err(GearsError::Other(
                 "no shared state has been set on this workflow".into(),
             )),
         }
@@ -424,7 +424,7 @@ impl WorkflowContext {
                 .inner
                 .activities
                 .get(activity_name)
-                .ok_or_else(|| ZdflowError::ActivityNotFound(activity_name.to_string()))?
+                .ok_or_else(|| GearsError::ActivityNotFound(activity_name.to_string()))?
                 .clone();
             let ctx = self.clone();
             set.spawn(async move {
@@ -437,7 +437,7 @@ impl WorkflowContext {
         while let Some(join_res) = set.join_next().await {
             match join_res {
                 Ok((i, result)) => results[i] = Some(result),
-                Err(e) => return Err(ZdflowError::TaskPanicked(e.to_string())),
+                Err(e) => return Err(GearsError::TaskPanicked(e.to_string())),
             }
         }
         Ok(results.into_iter().map(|r| r.unwrap()).collect())
@@ -563,7 +563,7 @@ impl WorkflowContext {
             .inner
             .activities
             .get(activity_name)
-            .ok_or_else(|| ZdflowError::ActivityNotFound(activity_name.to_string()))?
+            .ok_or_else(|| GearsError::ActivityNotFound(activity_name.to_string()))?
             .clone();
 
         self.execute_activity_inner(&*activity, input, sequence_id)
@@ -604,7 +604,7 @@ impl WorkflowContext {
             } = &event.payload
                 && *sid == sequence_id
             {
-                return Err(ZdflowError::ActivityFailed(error.clone()));
+                return Err(GearsError::ActivityFailed(error.clone()));
             }
         }
 
@@ -648,7 +648,7 @@ impl WorkflowContext {
                     tokio::select! {
                         biased;
                         _ = cancel_notify.notified(), if !self.is_cancelled() => {
-                            return Err(ZdflowError::Cancelled);
+                            return Err(GearsError::Cancelled);
                         }
                         result = tokio::time::timeout(duration, exec_future) => {
                             match result {
@@ -660,7 +660,7 @@ impl WorkflowContext {
                                         timeout_ms: duration.as_millis() as u64,
                                     })
                                     .await?;
-                                    Err(ZdflowError::ActivityTimedOut {
+                                    Err(GearsError::ActivityTimedOut {
                                         activity_name: activity.name().to_string(),
                                         timeout: duration,
                                     })
@@ -673,7 +673,7 @@ impl WorkflowContext {
                     tokio::select! {
                         biased;
                         _ = cancel_notify.notified(), if !self.is_cancelled() => {
-                            return Err(ZdflowError::Cancelled);
+                            return Err(GearsError::Cancelled);
                         }
                         result = exec_future => result,
                     }
@@ -735,7 +735,7 @@ impl WorkflowContext {
             activity = activity.name(),
             "activity exhausted all retries"
         );
-        Err(ZdflowError::ActivityFailed(last_error))
+        Err(GearsError::ActivityFailed(last_error))
     }
 
     /// Execute multiple activities in parallel, returning results in the
@@ -760,7 +760,7 @@ impl WorkflowContext {
                 .inner
                 .activities
                 .get(activity_name)
-                .ok_or_else(|| ZdflowError::ActivityNotFound(activity_name.to_string()))?
+                .ok_or_else(|| GearsError::ActivityNotFound(activity_name.to_string()))?
                 .clone();
             let ctx = self.clone();
             set.spawn(async move {
@@ -779,7 +779,7 @@ impl WorkflowContext {
                 }
                 Err(e) => {
                     set.abort_all();
-                    return Err(ZdflowError::TaskPanicked(e.to_string()));
+                    return Err(GearsError::TaskPanicked(e.to_string()));
                 }
             }
         }
@@ -792,7 +792,7 @@ impl WorkflowContext {
     pub async fn sleep(&self, duration: Duration) -> Result<()> {
         let wake_at = Utc::now()
             + chrono::Duration::from_std(duration)
-                .map_err(|e| ZdflowError::Other(e.to_string()))?;
+                .map_err(|e| GearsError::Other(e.to_string()))?;
         self.sleep_until(wake_at).await
     }
 
@@ -864,7 +864,7 @@ impl WorkflowContext {
             tokio::select! {
                 biased;
                 _ = self.inner.cancel_notify.notified(), if !self.is_cancelled() => {
-                    return Err(ZdflowError::Cancelled);
+                    return Err(GearsError::Cancelled);
                 }
                 _ = tokio::time::sleep(remaining) => {}
             }
@@ -904,7 +904,7 @@ impl WorkflowContext {
                 && cid == change_id
             {
                 if *version < min_version || *version > max_version {
-                    return Err(ZdflowError::VersionConflict {
+                    return Err(GearsError::VersionConflict {
                         change_id: change_id.to_string(),
                         stored: *version,
                         min: min_version,
@@ -937,7 +937,7 @@ impl WorkflowContext {
     /// | Workflow outcome | Cleanups run? |
     /// |---|---|
     /// | `Ok(output)` — completed successfully | **Yes** |
-    /// | `Err(ZdflowError::Cancelled)` — cancelled | **Yes** |
+    /// | `Err(GearsError::Cancelled)` — cancelled | **Yes** |
     /// | `Err(other)` — failed | **No** |
     ///
     /// Workflow failures are excluded because they may be transient (e.g. an
@@ -1038,7 +1038,7 @@ impl WorkflowContext {
     /// # Example
     ///
     /// ```rust,ignore
-    /// use zdflow::branch;
+    /// use gears::branch;
     ///
     /// // Copy a file, then in parallel: start a job AND make an API call.
     /// let copy_result = ctx.execute_activity("copy_file", input).await?;
@@ -1082,7 +1082,7 @@ impl WorkflowContext {
                 }
                 Err(e) => {
                     set.abort_all();
-                    return Err(ZdflowError::TaskPanicked(e.to_string()));
+                    return Err(GearsError::TaskPanicked(e.to_string()));
                 }
             }
         }
@@ -1120,7 +1120,7 @@ impl WorkflowContext {
         while let Some(join_res) = set.join_next().await {
             match join_res {
                 Ok((i, result)) => results[i] = Some(result),
-                Err(e) => return Err(ZdflowError::TaskPanicked(e.to_string())),
+                Err(e) => return Err(GearsError::TaskPanicked(e.to_string())),
             }
         }
         Ok(results.into_iter().map(|r| r.unwrap()).collect())
@@ -1173,13 +1173,13 @@ impl WorkflowContext {
             }
             Err(e) => {
                 handle_b.abort();
-                return Err(ZdflowError::TaskPanicked(e.to_string()));
+                return Err(GearsError::TaskPanicked(e.to_string()));
             }
         };
         let res_b = match handle_b.await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(e),
-            Err(e) => return Err(ZdflowError::TaskPanicked(e.to_string())),
+            Err(e) => return Err(GearsError::TaskPanicked(e.to_string())),
         };
 
         Ok((res_a, res_b))
@@ -1227,7 +1227,7 @@ impl WorkflowContext {
             Err(e) => {
                 handle_b.abort();
                 handle_c.abort();
-                return Err(ZdflowError::TaskPanicked(e.to_string()));
+                return Err(GearsError::TaskPanicked(e.to_string()));
             }
         };
         let res_b = match handle_b.await {
@@ -1238,13 +1238,13 @@ impl WorkflowContext {
             }
             Err(e) => {
                 handle_c.abort();
-                return Err(ZdflowError::TaskPanicked(e.to_string()));
+                return Err(GearsError::TaskPanicked(e.to_string()));
             }
         };
         let res_c = match handle_c.await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(e),
-            Err(e) => return Err(ZdflowError::TaskPanicked(e.to_string())),
+            Err(e) => return Err(GearsError::TaskPanicked(e.to_string())),
         };
 
         Ok((res_a, res_b, res_c))
@@ -1300,7 +1300,7 @@ impl WorkflowContext {
                 handle_b.abort();
                 handle_c.abort();
                 handle_d.abort();
-                return Err(ZdflowError::TaskPanicked(e.to_string()));
+                return Err(GearsError::TaskPanicked(e.to_string()));
             }
         };
         let res_b = match handle_b.await {
@@ -1313,7 +1313,7 @@ impl WorkflowContext {
             Err(e) => {
                 handle_c.abort();
                 handle_d.abort();
-                return Err(ZdflowError::TaskPanicked(e.to_string()));
+                return Err(GearsError::TaskPanicked(e.to_string()));
             }
         };
         let res_c = match handle_c.await {
@@ -1324,13 +1324,13 @@ impl WorkflowContext {
             }
             Err(e) => {
                 handle_d.abort();
-                return Err(ZdflowError::TaskPanicked(e.to_string()));
+                return Err(GearsError::TaskPanicked(e.to_string()));
             }
         };
         let res_d = match handle_d.await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(e),
-            Err(e) => return Err(ZdflowError::TaskPanicked(e.to_string())),
+            Err(e) => return Err(GearsError::TaskPanicked(e.to_string())),
         };
 
         Ok((res_a, res_b, res_c, res_d))

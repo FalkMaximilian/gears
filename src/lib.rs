@@ -12,7 +12,7 @@ pub mod worker;
 pub use context::{ActivityContext, BranchFn, BranchFuture, WorkflowContext, branch, BRANCH_BUDGET};
 pub use engine::{EngineHandle, WorkflowEngine, WorkflowEngineBuilder};
 pub use worker::CleanupPolicy;
-pub use error::{Result, ZdflowError};
+pub use error::{Result, GearsError};
 pub use event::{EventPayload, WorkflowEvent};
 pub use storage::SqliteStorage;
 pub use traits::{

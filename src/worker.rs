@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::context::{ActivityContext, WorkflowContext};
-use crate::error::ZdflowError;
+use crate::error::GearsError;
 use crate::event::EventPayload;
 use crate::metrics;
 use crate::traits::{Activity, RunStatus, Storage, Workflow};
@@ -28,7 +28,7 @@ type CancelHandles = Arc<Mutex<HashMap<Uuid, WorkflowContext>>>;
 /// Execute all registered cleanups that have not yet been completed or failed.
 ///
 /// This function is called by [`WorkerTask::run`] immediately after
-/// `Workflow::run` returns `Ok` or `Err(ZdflowError::Cancelled)`, and also
+/// `Workflow::run` returns `Ok` or `Err(GearsError::Cancelled)`, and also
 /// after `Err(other)` when [`CleanupPolicy::Always`] is configured. Under the
 /// default [`CleanupPolicy::OnSuccessOrCancelled`], workflow failures skip
 /// cleanups because they may be transient and recoverable.
@@ -246,7 +246,7 @@ impl WorkerTask {
                     .await;
                 metrics::inc_workflow_completed(workflow_name);
             }
-            Err(ZdflowError::Cancelled) => {
+            Err(GearsError::Cancelled) => {
                 tracing::info!(run_id = %run_id, "workflow cancelled — running cleanups");
                 run_cleanups(run_id, &self.storage, &self.activities, &worker_ctx).await;
                 let _ = worker_ctx

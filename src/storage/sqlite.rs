@@ -5,7 +5,7 @@ use serde_json::Value;
 use tokio_rusqlite::Connection;
 use uuid::Uuid;
 
-use crate::error::{Result, ZdflowError};
+use crate::error::{Result, GearsError};
 use crate::event::{EventPayload, WorkflowEvent};
 use crate::traits::{
     RunFilter, RunInfo, RunRecord, RunStatus, ScheduleRecord, ScheduleStatus, Storage,
@@ -88,7 +88,7 @@ impl Storage for SqliteStorage {
         let name = workflow_name.to_string();
         let input_json = match serde_json::to_string(input) {
             Ok(s) => s,
-            Err(e) => return Box::pin(async move { Err(ZdflowError::Serialize(e)) }),
+            Err(e) => return Box::pin(async move { Err(GearsError::Serialize(e)) }),
         };
         let now = Utc::now().timestamp_millis();
 
@@ -112,7 +112,7 @@ impl Storage for SqliteStorage {
         let run_id_str = run_id.to_string();
         let payload_json = match serde_json::to_string(&event.payload) {
             Ok(s) => s,
-            Err(e) => return Box::pin(async move { Err(ZdflowError::Serialize(e)) }),
+            Err(e) => return Box::pin(async move { Err(GearsError::Serialize(e)) }),
         };
         let occurred_at = event.occurred_at.timestamp_millis();
         let sequence = event.sequence;
@@ -201,7 +201,7 @@ impl Storage for SqliteStorage {
             let mut result = Vec::with_capacity(rows.len());
             for (run_id_str, name, input_json) in rows {
                 let run_id =
-                    Uuid::parse_str(&run_id_str).map_err(|e| ZdflowError::Other(e.to_string()))?;
+                    Uuid::parse_str(&run_id_str).map_err(|e| GearsError::Other(e.to_string()))?;
                 let input: Value = serde_json::from_str(&input_json)?;
                 result.push(RunRecord {
                     run_id,
@@ -231,7 +231,7 @@ impl Storage for SqliteStorage {
         .to_string();
         let result_json = match result.map(|v| serde_json::to_string(&v)).transpose() {
             Ok(s) => s,
-            Err(e) => return Box::pin(async move { Err(ZdflowError::Serialize(e)) }),
+            Err(e) => return Box::pin(async move { Err(GearsError::Serialize(e)) }),
         };
         let now = Utc::now().timestamp_millis();
 
@@ -381,7 +381,7 @@ impl Storage for SqliteStorage {
             let mut result = Vec::with_capacity(rows.len());
             for (run_id_str, name, status_str, created_at_ms, updated_at_ms) in rows {
                 let run_id =
-                    Uuid::parse_str(&run_id_str).map_err(|e| ZdflowError::Other(e.to_string()))?;
+                    Uuid::parse_str(&run_id_str).map_err(|e| GearsError::Other(e.to_string()))?;
                 let status = match status_str.as_str() {
                     "running" => RunStatus::Running,
                     "completed" => RunStatus::Completed,
@@ -418,7 +418,7 @@ impl Storage for SqliteStorage {
         let workflow_name = record.workflow_name.clone();
         let input_json = match serde_json::to_string(&record.input) {
             Ok(s) => s,
-            Err(e) => return Box::pin(async move { Err(ZdflowError::Serialize(e)) }),
+            Err(e) => return Box::pin(async move { Err(GearsError::Serialize(e)) }),
         };
         let status_str = match record.status {
             ScheduleStatus::Active => "active",

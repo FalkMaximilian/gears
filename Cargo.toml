@@ -1,14 +1,14 @@
 [package]
-name = "zdflow"
+name = "gears"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "zdflow"
+name = "gears"
 path = "src/lib.rs"
 
 [[bin]]
-name = "zdflow-demo"
+name = "gears-demo"
 path = "src/main.rs"
 
 [dependencies]

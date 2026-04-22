@@ -16,7 +16,7 @@ cargo clippy                 # Lint
 
 ## Architecture
 
-zdflow is a **durable workflow execution engine** (similar to Temporal.io) built in Rust. The core design is event sourcing + deterministic replay: all workflow state transitions are persisted to SQLite, enabling crash recovery by replaying history.
+gears is a **durable workflow execution engine** (similar to Temporal.io) built in Rust. The core design is event sourcing + deterministic replay: all workflow state transitions are persisted to SQLite, enabling crash recovery by replaying history.
 
 ### Execution Model
 
@@ -71,7 +71,7 @@ On engine startup, `list_running_workflows()` finds any in-progress runs and rep
 - **`worker.rs`** — `WorkerTask` executes a single workflow run end-to-end. Runs registered cleanups (LIFO, failures tolerated) before writing `WorkflowCompleted` or `WorkflowCancelled`. With `CleanupPolicy::Always`, also runs cleanups before `WorkflowFailed`. Defines `CleanupPolicy` enum.
 - **`storage/sqlite.rs`** — SQLite backend (WAL mode). Two tables: `workflow_runs` (metadata + status) and `workflow_events` (append-only event log).
 - **`metrics.rs`** — Optional metrics instrumentation behind the `metrics` Cargo feature.
-- **`error.rs`** — `ZdflowError` enum covering storage, serialization, execution, cancellation, and engine lifecycle errors. Specific variants for `ActivityTimedOut`, `VersionConflict`, `TaskPanicked`, `InvalidSchedule`, `RunNotFound`, `ScheduleNotFound`, `BranchBudgetExceeded`; `Other(String)` is reserved for truly unexpected errors.
+- **`error.rs`** — `GearsError` enum covering storage, serialization, execution, cancellation, and engine lifecycle errors. Specific variants for `ActivityTimedOut`, `VersionConflict`, `TaskPanicked`, `InvalidSchedule`, `RunNotFound`, `ScheduleNotFound`, `BranchBudgetExceeded`; `Other(String)` is reserved for truly unexpected errors.
 
 ### Deterministic Replay Invariant
 

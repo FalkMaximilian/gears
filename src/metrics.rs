@@ -1,29 +1,29 @@
 //! Optional metrics instrumentation, gated behind the `metrics` Cargo feature.
 //!
-//! When the feature is enabled, zdflow records counters, gauges and
+//! When the feature is enabled, gears records counters, gauges and
 //! histograms via the [`metrics`](https://docs.rs/metrics) facade. Users
 //! install their own exporter (e.g. `metrics-exporter-prometheus`).
 //!
 //! When the feature is disabled, all functions are no-ops.
 
 /// Total workflows started, labelled by workflow name.
-pub const WORKFLOW_STARTED: &str = "zdflow_workflow_started_total";
+pub const WORKFLOW_STARTED: &str = "gears_workflow_started_total";
 /// Total workflows completed successfully.
-pub const WORKFLOW_COMPLETED: &str = "zdflow_workflow_completed_total";
+pub const WORKFLOW_COMPLETED: &str = "gears_workflow_completed_total";
 /// Total workflows that failed.
-pub const WORKFLOW_FAILED: &str = "zdflow_workflow_failed_total";
+pub const WORKFLOW_FAILED: &str = "gears_workflow_failed_total";
 /// Total workflows cancelled.
-pub const WORKFLOW_CANCELLED: &str = "zdflow_workflow_cancelled_total";
+pub const WORKFLOW_CANCELLED: &str = "gears_workflow_cancelled_total";
 /// Currently active (in-progress) workflows.
-pub const WORKFLOW_ACTIVE: &str = "zdflow_workflow_active";
+pub const WORKFLOW_ACTIVE: &str = "gears_workflow_active";
 /// Total activity executions started.
-pub const ACTIVITY_STARTED: &str = "zdflow_activity_started_total";
+pub const ACTIVITY_STARTED: &str = "gears_activity_started_total";
 /// Total activity executions completed.
-pub const ACTIVITY_COMPLETED: &str = "zdflow_activity_completed_total";
+pub const ACTIVITY_COMPLETED: &str = "gears_activity_completed_total";
 /// Total activity retry attempts (not counting the first attempt).
-pub const ACTIVITY_RETRIES: &str = "zdflow_activity_retries_total";
+pub const ACTIVITY_RETRIES: &str = "gears_activity_retries_total";
 /// Activity execution duration in seconds.
-pub const ACTIVITY_DURATION: &str = "zdflow_activity_duration_seconds";
+pub const ACTIVITY_DURATION: &str = "gears_activity_duration_seconds";
 
 // ── Instrumentation helpers ──────────────────────────────────────────────
 

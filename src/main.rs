@@ -1,6 +1,6 @@
-//! zdflow demo — start a workflow from an Axum HTTP endpoint.
+//! gears demo — start a workflow from an Axum HTTP endpoint.
 //!
-//! Run:  cargo run --bin zdflow-demo
+//! Run:  cargo run --bin gears-demo
 //! Test: curl -X POST http://localhost:3000/greet \
 //!            -H 'Content-Type: application/json' \
 //!            -d '{"name": "Alice"}'
@@ -18,7 +18,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use zdflow::{
+use gears::{
     Activity, ActivityContext, ActivityFuture, SqliteStorage, TypedActivity, TypedActivityFuture,
     TypedWorkflow, TypedWorkflowFuture, Workflow, WorkflowContext, WorkflowEngine, WorkflowFuture,
 };
@@ -394,8 +394,8 @@ async fn list_schedules_handler(
             cron_expression: s.cron_expression,
             workflow_name: s.workflow_name,
             status: match s.status {
-                zdflow::ScheduleStatus::Active => "active".into(),
-                zdflow::ScheduleStatus::Paused => "paused".into(),
+                gears::ScheduleStatus::Active => "active".into(),
+                gears::ScheduleStatus::Paused => "paused".into(),
             },
             last_fired_at: s.last_fired_at.map(|t| t.to_rfc3339()),
         })
@@ -430,10 +430,10 @@ async fn resume_schedule_handler(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter("zdflow=debug,info")
+        .with_env_filter("gears=debug,info")
         .init();
 
-    let storage = SqliteStorage::open("zdflow-demo.db").await?;
+    let storage = SqliteStorage::open("gears-demo.db").await?;
 
     let mut engine = WorkflowEngine::builder()
         .with_storage(storage)

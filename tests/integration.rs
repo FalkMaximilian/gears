@@ -6,10 +6,10 @@ use uuid::Uuid;
 
 use std::sync::Arc;
 
-use zdflow::{
+use gears::{
     Activity, ActivityContext, ActivityFuture, CleanupPolicy, EventPayload, RunFilter, RunStatus,
     SqliteStorage, Storage, TypedActivity, TypedActivityFuture, TypedWorkflow, TypedWorkflowFuture,
-    Workflow, WorkflowContext, WorkflowEngine, WorkflowEvent, WorkflowFuture, ZdflowError, branch,
+    Workflow, WorkflowContext, WorkflowEngine, WorkflowEvent, WorkflowFuture, GearsError, branch,
 };
 
 // ── Test activities ──────────────────────────────────────────────────────
@@ -42,7 +42,7 @@ impl Activity for FailActivity {
     }
 
     fn execute(&self, _ctx: ActivityContext, _input: Value) -> ActivityFuture {
-        Box::pin(async move { Err(ZdflowError::Other("intentional failure".into())) })
+        Box::pin(async move { Err(GearsError::Other("intentional failure".into())) })
     }
 
     fn max_attempts(&self) -> u32 {
@@ -682,7 +682,7 @@ impl Activity for AlwaysFailCleanupActivity {
 
     fn execute(&self, _ctx: ActivityContext, _input: Value) -> ActivityFuture {
         Box::pin(async move {
-            Err(ZdflowError::Other("cleanup failed intentionally".into()))
+            Err(GearsError::Other("cleanup failed intentionally".into()))
         })
     }
 
@@ -718,7 +718,7 @@ impl Workflow for CleanupFailureWorkflow {
     fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
         Box::pin(async move {
             ctx.register_cleanup("cleanup_action", json!({})).await?;
-            Err(ZdflowError::Other("workflow failed intentionally".into()))
+            Err(GearsError::Other("workflow failed intentionally".into()))
         })
     }
 }
@@ -1051,7 +1051,7 @@ async fn test_invalid_cron_expression() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, ZdflowError::InvalidSchedule(_)),
+        matches!(err, GearsError::InvalidSchedule(_)),
         "expected InvalidSchedule error, got: {err:?}"
     );
 }
@@ -1122,7 +1122,7 @@ async fn test_schedule_fires() {
 /// (without re-executing the activity) and execute step B live.
 #[tokio::test]
 async fn test_crash_recovery() {
-    let db_path = format!("/tmp/zdflow-crash-recovery-{}.db", Uuid::new_v4());
+    let db_path = format!("/tmp/gears-crash-recovery-{}.db", Uuid::new_v4());
     let run_id = Uuid::new_v4();
 
     // Phase 1: Pre-populate the DB to simulate a crashed run where step A
@@ -1643,10 +1643,10 @@ async fn test_concurrent_branches_with_sleep() {
 /// and verify the second branch activity is executed live while the first is replayed.
 #[tokio::test]
 async fn test_concurrent_branches_crash_recovery() {
-    use zdflow::{BRANCH_BUDGET, EventPayload, WorkflowEvent};
+    use gears::{BRANCH_BUDGET, EventPayload, WorkflowEvent};
     use chrono::Utc;
 
-    let db_path = format!("/tmp/zdflow_concurrent_recovery_{}.db", Uuid::new_v4());
+    let db_path = format!("/tmp/gears_concurrent_recovery_{}.db", Uuid::new_v4());
     let storage = SqliteStorage::open(&db_path).await.unwrap();
 
     // Pre-create a run for ConcurrentBranchesWorkflow.

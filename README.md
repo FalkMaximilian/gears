@@ -1,10 +1,10 @@
-# ZDFlow
+# Gears
 
-A durable workflow execution engine written in Rust, inspired by [Temporal.io](https://temporal.io). zdflow lets you write long-running, stateful business processes as ordinary async Rust functions — crash the process mid-execution, restart it, and the workflow resumes exactly where it left off.
+A durable workflow execution engine written in Rust, inspired by [Temporal.io](https://temporal.io). gears lets you write long-running, stateful business processes as ordinary async Rust functions — crash the process mid-execution, restart it, and the workflow resumes exactly where it left off.
 
 ## How it works
 
-ZDFlow persists every state transition to an append-only event log (SQLite). When a workflow is re-executed after a crash, the engine **replays** those events to fast-forward to the point where execution stopped, then continues from there.
+Gears persists every state transition to an append-only event log (SQLite). When a workflow is re-executed after a crash, the engine **replays** those events to fast-forward to the point where execution stopped, then continues from there.
 
 ```mermaid
 sequenceDiagram
@@ -260,7 +260,7 @@ If any activity fails, remaining in-flight activities are cancelled and the firs
 `ctx.concurrently()` runs multiple workflow branches in parallel, where each branch is an async closure with its own `WorkflowContext`. Unlike `execute_activities_parallel` (which fans out individual activities), `concurrently` can run entire multi-step sequences concurrently — activities, sleeps, or further nested calls.
 
 ```rust
-use zdflow::branch;
+use gears::branch;
 
 fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture {
     Box::pin(async move {
@@ -341,7 +341,7 @@ Unlike `execute_activity` and `sleep`, version markers are keyed by `change_id` 
 
 ### Workflow cancellation
 
-Running workflows can be cancelled via `engine.cancel_workflow(run_id)`. At the next yield point (`execute_activity` or `sleep`), the context returns `ZdflowError::Cancelled`, a `WorkflowCancelled` event is written, and the run status is set to `Cancelled`.
+Running workflows can be cancelled via `engine.cancel_workflow(run_id)`. At the next yield point (`execute_activity` or `sleep`), the context returns `GearsError::Cancelled`, a `WorkflowCancelled` event is written, and the run status is set to `Cancelled`.
 
 ```rust
 engine.cancel_workflow(run_id).await?;
@@ -625,7 +625,7 @@ Returns the UTC timestamp at which this workflow run started. For recovered or r
 let started_at = ctx.workflow_start_time();
 let deadline = started_at + chrono::Duration::hours(24);
 if Utc::now() > deadline {
-    return Err(ZdflowError::Other("workflow exceeded 24h deadline".into()));
+    return Err(GearsError::Other("workflow exceeded 24h deadline".into()));
 }
 ```
 
@@ -809,7 +809,7 @@ The dispatch loop runs as a background Tokio task started by `engine.run()`. For
 
 ### 5. Cancellation
 
-When `engine.cancel_workflow(run_id)` is called, it sets an atomic flag on the context and fires a `tokio::sync::Notify`. The workflow's next `execute_activity` or `sleep` call will see the flag and return `ZdflowError::Cancelled`. If the workflow is mid-activity, the `tokio::select!` inside the activity execution wakes on the notification and returns `Cancelled` immediately — the activity is interrupted rather than completing.
+When `engine.cancel_workflow(run_id)` is called, it sets an atomic flag on the context and fires a `tokio::sync::Notify`. The workflow's next `execute_activity` or `sleep` call will see the flag and return `GearsError::Cancelled`. If the workflow is mid-activity, the `tokio::select!` inside the activity execution wakes on the notification and returns `Cancelled` immediately — the activity is interrupted rather than completing.
 
 ### 6. WorkerTask completion
 
@@ -818,7 +818,7 @@ After `workflow.run` returns, registered cleanups are executed (where applicable
 | Result | Cleanups run? | Terminal event written | Final status |
 |---|---|---|---|
 | `Ok(output)` | **Yes** | `WorkflowCompleted { output }` | `Completed` |
-| `Err(ZdflowError::Cancelled)` | **Yes** | `WorkflowCancelled { reason }` | `Cancelled` |
+| `Err(GearsError::Cancelled)` | **Yes** | `WorkflowCancelled { reason }` | `Cancelled` |
 | `Err(other)` — default policy | No | `WorkflowFailed { error }` | `Failed` |
 | `Err(other)` — `CleanupPolicy::Always` | **Yes** | `WorkflowFailed { error }` | `Failed` |
 
@@ -832,11 +832,11 @@ If the process dies at any point, the run's status remains `Running` in the data
 
 ## Metrics
 
-zdflow optionally records metrics via the [`metrics`](https://docs.rs/metrics) facade. Enable the `metrics` Cargo feature and install your own exporter (e.g. `metrics-exporter-prometheus`).
+gears optionally records metrics via the [`metrics`](https://docs.rs/metrics) facade. Enable the `metrics` Cargo feature and install your own exporter (e.g. `metrics-exporter-prometheus`).
 
 ```toml
 [dependencies]
-zdflow = { version = "0.1", features = ["metrics"] }
+gears = { version = "0.1", features = ["metrics"] }
 metrics-exporter-prometheus = "0.16"
 ```
 
@@ -844,19 +844,19 @@ Emitted metrics:
 
 | Metric | Type | Description |
 |---|---|---|
-| `zdflow_workflow_started_total` | counter | Workflows started (label: `workflow`) |
-| `zdflow_workflow_completed_total` | counter | Workflows completed successfully |
-| `zdflow_workflow_failed_total` | counter | Workflows that failed |
-| `zdflow_workflow_cancelled_total` | counter | Workflows cancelled |
-| `zdflow_workflow_active` | gauge | Currently in-progress workflows |
-| `zdflow_activity_started_total` | counter | Activity executions started (label: `activity`) |
-| `zdflow_activity_completed_total` | counter | Activity executions completed |
-| `zdflow_activity_retries_total` | counter | Activity retry attempts |
-| `zdflow_activity_duration_seconds` | histogram | Activity execution duration |
+| `gears_workflow_started_total` | counter | Workflows started (label: `workflow`) |
+| `gears_workflow_completed_total` | counter | Workflows completed successfully |
+| `gears_workflow_failed_total` | counter | Workflows that failed |
+| `gears_workflow_cancelled_total` | counter | Workflows cancelled |
+| `gears_workflow_active` | gauge | Currently in-progress workflows |
+| `gears_activity_started_total` | counter | Activity executions started (label: `activity`) |
+| `gears_activity_completed_total` | counter | Activity executions completed |
+| `gears_activity_retries_total` | counter | Activity retry attempts |
+| `gears_activity_duration_seconds` | histogram | Activity execution duration |
 
 ## Error handling
 
-`ZdflowError` variants and when you will encounter them:
+`GearsError` variants and when you will encounter them:
 
 | Variant | When it occurs | What to do |
 |---|---|---|
@@ -884,12 +884,12 @@ Emitted metrics:
 
 ## Logging
 
-zdflow uses [`tracing`](https://docs.rs/tracing) for structured logging. Set the `RUST_LOG` environment variable to control verbosity:
+gears uses [`tracing`](https://docs.rs/tracing) for structured logging. Set the `RUST_LOG` environment variable to control verbosity:
 
 ```bash
-RUST_LOG=zdflow=debug cargo run   # verbose — logs every replay step, activity attempt, timer
-RUST_LOG=zdflow=info  cargo run   # normal  — workflow start/complete/fail, activity complete, recovery
-RUST_LOG=zdflow=warn  cargo run   # quiet   — only warnings and errors
+RUST_LOG=gears=debug cargo run   # verbose — logs every replay step, activity attempt, timer
+RUST_LOG=gears=info  cargo run   # normal  — workflow start/complete/fail, activity complete, recovery
+RUST_LOG=gears=warn  cargo run   # quiet   — only warnings and errors
 ```
 
 Key events at each level:
@@ -1019,7 +1019,7 @@ All workflow workers run as Tokio tasks within the same OS process as the engine
 - Horizontal scaling (adding more machines) does not spread workflow load — only the single process holding the engine executes workflows.
 - Vertical scaling (adding CPU cores) does help within the concurrency limit set on `WorkflowEngineBuilder`, since workers are async tasks sharing the Tokio thread pool.
 
-Scaling out across multiple processes or hosts would require adding a distributed task-queue layer (e.g., having workers poll a shared database or message broker for work) and is out of scope for zdflow's current design.
+Scaling out across multiple processes or hosts would require adding a distributed task-queue layer (e.g., having workers poll a shared database or message broker for work) and is out of scope for gears's current design.
 
 ## Future improvements
 

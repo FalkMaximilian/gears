@@ -277,6 +277,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "gears"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "metrics",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-cron-scheduler",
+ "tokio-rusqlite",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1347,26 +1367,6 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
-]
-
-[[package]]
-name = "zdflow"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "metrics",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-cron-scheduler",
- "tokio-rusqlite",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

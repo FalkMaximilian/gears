@@ -4,7 +4,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 #[derive(Debug, Error)]
-pub enum ZdflowError {
+pub enum GearsError {
     #[error("storage error: {0}")]
     Storage(#[from] tokio_rusqlite::Error),
 
@@ -69,4 +69,4 @@ pub enum ZdflowError {
     Other(String),
 }
 
-pub type Result<T> = std::result::Result<T, ZdflowError>;
+pub type Result<T> = std::result::Result<T, GearsError>;
