@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -17,6 +19,54 @@ use crate::metrics;
 use crate::traits::{Activity, Storage};
 
 use std::collections::HashMap;
+
+// ── Branch types ──────────────────────────────────────────────────────────
+
+/// The maximum number of sequence IDs reserved per concurrent branch.
+///
+/// Each call to `concurrently` (and typed variants) reserves this many IDs for
+/// each branch it spawns. A branch that performs more than `BRANCH_BUDGET`
+/// total operations (activities, sleeps, nested `concurrently` forks) will
+/// return [`ZdflowError::BranchBudgetExceeded`].
+///
+/// **Nested `concurrently` within a branch**: each inner fork claims
+/// `1 + n × BRANCH_BUDGET` IDs from the outer branch's budget, so deep
+/// nesting is impractical at the default value. Call `concurrently` from the
+/// root workflow context when possible.
+pub const BRANCH_BUDGET: u32 = 1000;
+
+/// Pinned boxed future returned by a concurrent branch closure.
+pub type BranchFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>;
+
+/// A boxed branch closure for use with [`WorkflowContext::concurrently`].
+///
+/// Construct one with the [`branch`] helper function.
+pub type BranchFn = Box<dyn FnOnce(WorkflowContext) -> BranchFuture + Send + 'static>;
+
+/// Box a branch closure for use with [`WorkflowContext::concurrently`].
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use zdflow::{branch, WorkflowContext};
+///
+/// let results = ctx.concurrently(vec![
+///     branch(|ctx| async move {
+///         let r1 = ctx.execute_activity("step_a", input_a).await?;
+///         ctx.execute_activity("step_b", r1).await
+///     }),
+///     branch(|ctx| async move {
+///         ctx.execute_activity("step_c", input_c).await
+///     }),
+/// ]).await?;
+/// ```
+pub fn branch<F, Fut>(f: F) -> BranchFn
+where
+    F: FnOnce(WorkflowContext) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<Value>> + Send + 'static,
+{
+    Box::new(move |ctx| Box::pin(f(ctx)))
+}
 
 // ── ActivityContext ───────────────────────────────────────────────────────
 
@@ -52,22 +102,33 @@ impl ActivityContext {
 
 // ── WorkflowContext ───────────────────────────────────────────────────────
 
-/// Passed to every workflow execution. Provides `execute_activity` and
-/// `sleep` / `sleep_until`.
+/// Passed to every workflow execution. Provides `execute_activity`,
+/// `sleep` / `sleep_until`, and `concurrently` for parallel branches.
 ///
 /// Internally this type holds the pre-loaded event history and a
 /// monotonically-increasing `call_counter`. Every call to
-/// `execute_activity` or `sleep*` increments the counter and uses it as
-/// the `sequence_id` to look up cached results in history.
+/// `execute_activity`, `sleep*`, `register_cleanup`, or `concurrently`
+/// increments the counter and uses it as the `sequence_id` to look up
+/// cached results in history.
+///
+/// **Branch mode**: contexts created by `concurrently` have their own
+/// per-branch counter (`branch_counter`) and a fixed `branch_base` offset.
+/// All other fields are shared with the root context via `Arc`.
 #[derive(Clone)]
 pub struct WorkflowContext {
     pub(crate) run_id: Uuid,
     inner: Arc<ContextInner>,
+    /// Present only in branch-mode contexts created by `concurrently`.
+    /// `None` in the root workflow context (which uses `inner.call_counter`).
+    branch_counter: Option<Arc<AtomicU32>>,
+    /// Offset added to `branch_counter` to produce global sequence IDs.
+    /// Zero in the root context.
+    branch_base: u32,
 }
 
 struct ContextInner {
     history: Vec<WorkflowEvent>,
-    /// Number of logical calls made so far in this execution.
+    /// Global call counter for the root context. Not used by branch contexts.
     call_counter: AtomicU32,
     /// Global event sequence counter for the run (separate from call_counter).
     event_seq: AtomicU64,
@@ -140,6 +201,8 @@ impl WorkflowContext {
                 replay_depth,
                 workflow_start_time,
             }),
+            branch_counter: None,
+            branch_base: 0,
         }
     }
 
@@ -162,7 +225,11 @@ impl WorkflowContext {
     /// calls to `execute_activity` or `sleep`; those are always safe to call
     /// regardless of replay state.
     pub fn is_replaying(&self) -> bool {
-        self.inner.call_counter.load(Ordering::SeqCst) < self.inner.replay_depth
+        let current_seq = match &self.branch_counter {
+            Some(counter) => self.branch_base + counter.load(Ordering::SeqCst),
+            None => self.inner.call_counter.load(Ordering::SeqCst),
+        };
+        current_seq < self.inner.replay_depth
     }
 
     /// Returns the UTC timestamp at which this workflow run started.
@@ -187,6 +254,77 @@ impl WorkflowContext {
         } else {
             Ok(())
         }
+    }
+
+    // ── Sequence ID helpers ───────────────────────────────────────────────
+
+    /// Returns the next sequence ID, advancing either the branch-local or
+    /// global counter depending on whether this is a branch context.
+    fn next_sequence_id(&self) -> Result<u32> {
+        match &self.branch_counter {
+            Some(counter) => {
+                let local = counter.fetch_add(1, Ordering::SeqCst);
+                if local >= BRANCH_BUDGET {
+                    return Err(ZdflowError::BranchBudgetExceeded {
+                        budget: BRANCH_BUDGET,
+                    });
+                }
+                Ok(self.branch_base + local)
+            }
+            None => Ok(self.inner.call_counter.fetch_add(1, Ordering::SeqCst)),
+        }
+    }
+
+    /// Atomically claims `n` consecutive sequence IDs and returns the base.
+    /// Callers use `base + 0`, `base + 1`, ..., `base + n - 1`.
+    fn next_n_sequence_ids(&self, n: u32) -> Result<u32> {
+        match &self.branch_counter {
+            Some(counter) => {
+                let local = counter.fetch_add(n, Ordering::SeqCst);
+                if local.checked_add(n).map(|sum| sum > BRANCH_BUDGET).unwrap_or(true) {
+                    return Err(ZdflowError::BranchBudgetExceeded {
+                        budget: BRANCH_BUDGET,
+                    });
+                }
+                Ok(self.branch_base + local)
+            }
+            None => Ok(self.inner.call_counter.fetch_add(n, Ordering::SeqCst)),
+        }
+    }
+
+    /// Create a branch-mode context with its own local counter starting at `branch_base`.
+    /// Shares history, storage, cancellation, activities, and shared state with the parent.
+    fn make_branch_ctx(&self, branch_base: u32) -> WorkflowContext {
+        WorkflowContext {
+            run_id: self.run_id,
+            inner: self.inner.clone(),
+            branch_counter: Some(Arc::new(AtomicU32::new(0))),
+            branch_base,
+        }
+    }
+
+    /// Allocate sequence IDs for a concurrent fork and persist the marker event
+    /// if this is a live execution (not a replay). Returns `(fork_seq, block_base)`.
+    async fn alloc_concurrent_fork(&self, num_branches: u32) -> Result<(u32, u32)> {
+        let fork_seq = self.next_sequence_id()?;
+        let block_base = self.next_n_sequence_ids(num_branches * BRANCH_BUDGET)?;
+
+        let already_started = self.inner.history.iter().any(|e| {
+            matches!(
+                &e.payload,
+                EventPayload::ConcurrentBranchesStarted { sequence_id: sid, .. } if *sid == fork_seq
+            )
+        });
+        if !already_started {
+            self.append_event(EventPayload::ConcurrentBranchesStarted {
+                sequence_id: fork_seq,
+                num_branches,
+                branch_budget: BRANCH_BUDGET,
+            })
+            .await?;
+        }
+
+        Ok((fork_seq, block_base))
     }
 
     // ── shared state ─────────────────────────────────────────────────────
@@ -277,7 +415,7 @@ impl WorkflowContext {
         activities: Vec<(&str, Value)>,
     ) -> Result<Vec<Result<Value>>> {
         let n = activities.len();
-        let base = self.inner.call_counter.fetch_add(n as u32, Ordering::SeqCst);
+        let base = self.next_n_sequence_ids(n as u32)?;
 
         let mut set: JoinSet<(usize, Result<Value>)> = JoinSet::new();
         for (i, (activity_name, input)) in activities.into_iter().enumerate() {
@@ -419,7 +557,7 @@ impl WorkflowContext {
     /// returned immediately (replay). Otherwise the activity is executed
     /// live with automatic retry.
     pub async fn execute_activity(&self, activity_name: &str, input: Value) -> Result<Value> {
-        let sequence_id = self.inner.call_counter.fetch_add(1, Ordering::SeqCst);
+        let sequence_id = self.next_sequence_id()?;
 
         let activity = self
             .inner
@@ -613,7 +751,7 @@ impl WorkflowContext {
         activities: Vec<(&str, Value)>,
     ) -> Result<Vec<Value>> {
         let n = activities.len();
-        let base = self.inner.call_counter.fetch_add(n as u32, Ordering::SeqCst);
+        let base = self.next_n_sequence_ids(n as u32)?;
 
         let mut set: JoinSet<(usize, Result<Value>)> = JoinSet::new();
         for (i, (activity_name, input)) in activities.into_iter().enumerate() {
@@ -666,7 +804,7 @@ impl WorkflowContext {
     pub async fn sleep_until(&self, wake_at: DateTime<Utc>) -> Result<()> {
         self.check_cancelled()?;
 
-        let sequence_id = self.inner.call_counter.fetch_add(1, Ordering::SeqCst);
+        let sequence_id = self.next_sequence_id()?;
 
         // ── Replay: timer already fired ───────────────────────────────
         for event in &self.inner.history {
@@ -851,7 +989,7 @@ impl WorkflowContext {
     /// ctx.sleep(Duration::from_secs(300)).await?;
     /// ```
     pub async fn register_cleanup(&self, activity_name: &str, input: Value) -> Result<()> {
-        let sequence_id = self.inner.call_counter.fetch_add(1, Ordering::SeqCst);
+        let sequence_id = self.next_sequence_id()?;
 
         // Replay path: if CleanupRegistered at this sequence_id is already in
         // history, return without persisting again.
@@ -872,6 +1010,330 @@ impl WorkflowContext {
             input,
         })
         .await
+    }
+
+    // ── concurrently ─────────────────────────────────────────────────────
+
+    /// Run multiple workflow branches concurrently and return all results.
+    ///
+    /// Each branch is an async closure that receives its own
+    /// [`WorkflowContext`] and can execute any workflow primitives:
+    /// activities, sleeps, nested `concurrently` calls, etc. All branches
+    /// start immediately and run in parallel via tokio tasks.
+    ///
+    /// **Fail-fast**: if any branch returns an error, all remaining branches
+    /// are aborted and the error is propagated. Use
+    /// [`try_concurrently`](Self::try_concurrently) to collect all results
+    /// including per-branch failures.
+    ///
+    /// Use the [`branch`] helper to box closures for this method.
+    ///
+    /// # Deterministic replay
+    ///
+    /// Each branch is allocated a contiguous range of `BRANCH_BUDGET`
+    /// sequence IDs. On replay, the same ranges are reconstructed from the
+    /// same counter state, so every activity in every branch finds its
+    /// cached result in history.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use zdflow::branch;
+    ///
+    /// // Copy a file, then in parallel: start a job AND make an API call.
+    /// let copy_result = ctx.execute_activity("copy_file", input).await?;
+    ///
+    /// let results = ctx.concurrently(vec![
+    ///     branch(|ctx| async move {
+    ///         let job = ctx.execute_activity("start_job", copy_result.clone()).await?;
+    ///         ctx.execute_activity("poll_job", job).await
+    ///     }),
+    ///     branch(|ctx| async move {
+    ///         let resp = ctx.execute_activity("make_api_call", json!({})).await?;
+    ///         ctx.execute_activity("process_response", resp).await
+    ///     }),
+    /// ]).await?;
+    /// ```
+    pub async fn concurrently(&self, branches: Vec<BranchFn>) -> Result<Vec<Value>> {
+        let n = branches.len();
+        if n == 0 {
+            return Ok(vec![]);
+        }
+        self.check_cancelled()?;
+
+        let (_fork_seq, block_base) = self.alloc_concurrent_fork(n as u32).await?;
+
+        let mut set: JoinSet<(usize, Result<Value>)> = JoinSet::new();
+        for (i, branch_fn) in branches.into_iter().enumerate() {
+            let branch_ctx = self.make_branch_ctx(block_base + i as u32 * BRANCH_BUDGET);
+            set.spawn(async move {
+                let result = branch_fn(branch_ctx).await;
+                (i, result)
+            });
+        }
+
+        let mut results = vec![Value::Null; n];
+        while let Some(join_res) = set.join_next().await {
+            match join_res {
+                Ok((i, Ok(v))) => results[i] = v,
+                Ok((_, Err(e))) => {
+                    set.abort_all();
+                    return Err(e);
+                }
+                Err(e) => {
+                    set.abort_all();
+                    return Err(ZdflowError::TaskPanicked(e.to_string()));
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Run multiple workflow branches concurrently and collect *all* results,
+    /// including per-branch failures.
+    ///
+    /// Unlike [`concurrently`](Self::concurrently), this does not
+    /// short-circuit on the first error — every branch runs to completion.
+    /// Returns `Err` only for unexpected task panics (`TaskPanicked`).
+    /// Per-branch failures are `Err` items inside the returned `Vec`.
+    ///
+    /// Use the [`branch`] helper to box closures for this method.
+    pub async fn try_concurrently(&self, branches: Vec<BranchFn>) -> Result<Vec<Result<Value>>> {
+        let n = branches.len();
+        if n == 0 {
+            return Ok(vec![]);
+        }
+        self.check_cancelled()?;
+
+        let (_fork_seq, block_base) = self.alloc_concurrent_fork(n as u32).await?;
+
+        let mut set: JoinSet<(usize, Result<Value>)> = JoinSet::new();
+        for (i, branch_fn) in branches.into_iter().enumerate() {
+            let branch_ctx = self.make_branch_ctx(block_base + i as u32 * BRANCH_BUDGET);
+            set.spawn(async move {
+                let result = branch_fn(branch_ctx).await;
+                (i, result)
+            });
+        }
+
+        let mut results: Vec<Option<Result<Value>>> = (0..n).map(|_| None).collect();
+        while let Some(join_res) = set.join_next().await {
+            match join_res {
+                Ok((i, result)) => results[i] = Some(result),
+                Err(e) => return Err(ZdflowError::TaskPanicked(e.to_string())),
+            }
+        }
+        Ok(results.into_iter().map(|r| r.unwrap()).collect())
+    }
+
+    /// Run exactly 2 concurrent branches, returning a typed tuple.
+    ///
+    /// Each branch closure receives its own [`WorkflowContext`] and may
+    /// return a different output type. If either branch fails, the other is
+    /// aborted and the error is returned.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let (job_result, api_result): (JobOutput, ApiOutput) = ctx
+    ///     .concurrently_2(
+    ///         |ctx| async move { ctx.execute_activity_typed("start_job", &input).await },
+    ///         |ctx| async move { ctx.execute_activity_typed("make_api_call", &req).await },
+    ///     )
+    ///     .await?;
+    /// ```
+    pub async fn concurrently_2<A, B, FA, FB, FutA, FutB>(
+        &self,
+        branch_a: FA,
+        branch_b: FB,
+    ) -> Result<(A, B)>
+    where
+        FA: FnOnce(WorkflowContext) -> FutA + Send + 'static,
+        FutA: Future<Output = Result<A>> + Send + 'static,
+        FB: FnOnce(WorkflowContext) -> FutB + Send + 'static,
+        FutB: Future<Output = Result<B>> + Send + 'static,
+        A: Send + 'static,
+        B: Send + 'static,
+    {
+        self.check_cancelled()?;
+
+        let (_fork_seq, block_base) = self.alloc_concurrent_fork(2).await?;
+
+        let ctx_a = self.make_branch_ctx(block_base);
+        let ctx_b = self.make_branch_ctx(block_base + BRANCH_BUDGET);
+
+        let handle_a = tokio::spawn(branch_a(ctx_a));
+        let handle_b = tokio::spawn(branch_b(ctx_b));
+
+        let res_a = match handle_a.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                handle_b.abort();
+                return Err(e);
+            }
+            Err(e) => {
+                handle_b.abort();
+                return Err(ZdflowError::TaskPanicked(e.to_string()));
+            }
+        };
+        let res_b = match handle_b.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(ZdflowError::TaskPanicked(e.to_string())),
+        };
+
+        Ok((res_a, res_b))
+    }
+
+    /// Run exactly 3 concurrent branches, returning a typed tuple.
+    ///
+    /// If any branch fails, the others are aborted and the error is returned.
+    pub async fn concurrently_3<A, B, C, FA, FB, FC, FutA, FutB, FutC>(
+        &self,
+        branch_a: FA,
+        branch_b: FB,
+        branch_c: FC,
+    ) -> Result<(A, B, C)>
+    where
+        FA: FnOnce(WorkflowContext) -> FutA + Send + 'static,
+        FutA: Future<Output = Result<A>> + Send + 'static,
+        FB: FnOnce(WorkflowContext) -> FutB + Send + 'static,
+        FutB: Future<Output = Result<B>> + Send + 'static,
+        FC: FnOnce(WorkflowContext) -> FutC + Send + 'static,
+        FutC: Future<Output = Result<C>> + Send + 'static,
+        A: Send + 'static,
+        B: Send + 'static,
+        C: Send + 'static,
+    {
+        self.check_cancelled()?;
+
+        let (_fork_seq, block_base) = self.alloc_concurrent_fork(3).await?;
+
+        let ctx_a = self.make_branch_ctx(block_base);
+        let ctx_b = self.make_branch_ctx(block_base + BRANCH_BUDGET);
+        let ctx_c = self.make_branch_ctx(block_base + 2 * BRANCH_BUDGET);
+
+        let handle_a = tokio::spawn(branch_a(ctx_a));
+        let handle_b = tokio::spawn(branch_b(ctx_b));
+        let handle_c = tokio::spawn(branch_c(ctx_c));
+
+        let res_a = match handle_a.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                handle_b.abort();
+                handle_c.abort();
+                return Err(e);
+            }
+            Err(e) => {
+                handle_b.abort();
+                handle_c.abort();
+                return Err(ZdflowError::TaskPanicked(e.to_string()));
+            }
+        };
+        let res_b = match handle_b.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                handle_c.abort();
+                return Err(e);
+            }
+            Err(e) => {
+                handle_c.abort();
+                return Err(ZdflowError::TaskPanicked(e.to_string()));
+            }
+        };
+        let res_c = match handle_c.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(ZdflowError::TaskPanicked(e.to_string())),
+        };
+
+        Ok((res_a, res_b, res_c))
+    }
+
+    /// Run exactly 4 concurrent branches, returning a typed tuple.
+    ///
+    /// If any branch fails, the others are aborted and the error is returned.
+    pub async fn concurrently_4<A, B, C, D, FA, FB, FC, FD, FutA, FutB, FutC, FutD>(
+        &self,
+        branch_a: FA,
+        branch_b: FB,
+        branch_c: FC,
+        branch_d: FD,
+    ) -> Result<(A, B, C, D)>
+    where
+        FA: FnOnce(WorkflowContext) -> FutA + Send + 'static,
+        FutA: Future<Output = Result<A>> + Send + 'static,
+        FB: FnOnce(WorkflowContext) -> FutB + Send + 'static,
+        FutB: Future<Output = Result<B>> + Send + 'static,
+        FC: FnOnce(WorkflowContext) -> FutC + Send + 'static,
+        FutC: Future<Output = Result<C>> + Send + 'static,
+        FD: FnOnce(WorkflowContext) -> FutD + Send + 'static,
+        FutD: Future<Output = Result<D>> + Send + 'static,
+        A: Send + 'static,
+        B: Send + 'static,
+        C: Send + 'static,
+        D: Send + 'static,
+    {
+        self.check_cancelled()?;
+
+        let (_fork_seq, block_base) = self.alloc_concurrent_fork(4).await?;
+
+        let ctx_a = self.make_branch_ctx(block_base);
+        let ctx_b = self.make_branch_ctx(block_base + BRANCH_BUDGET);
+        let ctx_c = self.make_branch_ctx(block_base + 2 * BRANCH_BUDGET);
+        let ctx_d = self.make_branch_ctx(block_base + 3 * BRANCH_BUDGET);
+
+        let handle_a = tokio::spawn(branch_a(ctx_a));
+        let handle_b = tokio::spawn(branch_b(ctx_b));
+        let handle_c = tokio::spawn(branch_c(ctx_c));
+        let handle_d = tokio::spawn(branch_d(ctx_d));
+
+        let res_a = match handle_a.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                handle_b.abort();
+                handle_c.abort();
+                handle_d.abort();
+                return Err(e);
+            }
+            Err(e) => {
+                handle_b.abort();
+                handle_c.abort();
+                handle_d.abort();
+                return Err(ZdflowError::TaskPanicked(e.to_string()));
+            }
+        };
+        let res_b = match handle_b.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                handle_c.abort();
+                handle_d.abort();
+                return Err(e);
+            }
+            Err(e) => {
+                handle_c.abort();
+                handle_d.abort();
+                return Err(ZdflowError::TaskPanicked(e.to_string()));
+            }
+        };
+        let res_c = match handle_c.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                handle_d.abort();
+                return Err(e);
+            }
+            Err(e) => {
+                handle_d.abort();
+                return Err(ZdflowError::TaskPanicked(e.to_string()));
+            }
+        };
+        let res_d = match handle_d.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(ZdflowError::TaskPanicked(e.to_string())),
+        };
+
+        Ok((res_a, res_b, res_c, res_d))
     }
 
     // ── helpers ───────────────────────────────────────────────────────────

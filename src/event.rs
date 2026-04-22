@@ -107,6 +107,21 @@ pub enum EventPayload {
 
     /// Workflow function returned an error.
     WorkflowFailed { error: String },
+
+    /// Marks the start of a concurrent-branch fork in history.
+    ///
+    /// Written by `WorkflowContext::concurrently` and friends when executing
+    /// live (skipped on replay if already present). Records how many branches
+    /// were spawned and the per-branch sequence-ID budget so that the fork
+    /// point is observable in the event log.
+    ConcurrentBranchesStarted {
+        /// The sequence_id claimed for this fork point.
+        sequence_id: u32,
+        /// Number of parallel branches spawned.
+        num_branches: u32,
+        /// Sequence-ID budget reserved per branch.
+        branch_budget: u32,
+    },
 }
 
 #[cfg(test)]
@@ -183,6 +198,11 @@ mod tests {
         round_trip(EventPayload::CleanupFailed {
             sequence_id: 5,
             error: "file not found".into(),
+        });
+        round_trip(EventPayload::ConcurrentBranchesStarted {
+            sequence_id: 10,
+            num_branches: 3,
+            branch_budget: 1000,
         });
     }
 }

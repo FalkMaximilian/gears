@@ -61,6 +61,10 @@ pub enum ZdflowError {
     #[error("schedule not found: '{0}'")]
     ScheduleNotFound(String),
 
+    /// A concurrent branch exhausted its pre-allocated sequence-ID budget.
+    #[error("concurrent branch exceeded its sequence-id budget of {budget}")]
+    BranchBudgetExceeded { budget: u32 },
+
     #[error("{0}")]
     Other(String),
 }

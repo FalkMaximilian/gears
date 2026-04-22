@@ -255,6 +255,67 @@ let results = ctx.execute_activities_parallel(vec![
 
 If any activity fails, remaining in-flight activities are cancelled and the first error is returned.
 
+### Concurrent branches
+
+`ctx.concurrently()` runs multiple workflow branches in parallel, where each branch is an async closure with its own `WorkflowContext`. Unlike `execute_activities_parallel` (which fans out individual activities), `concurrently` can run entire multi-step sequences concurrently — activities, sleeps, or further nested calls.
+
+```rust
+use zdflow::branch;
+
+fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture {
+    Box::pin(async move {
+        // Step 1: sequential
+        let copied = ctx.execute_activity("copy_file", input).await?;
+
+        // Step 2: two branches running in parallel
+        let results = ctx.concurrently(vec![
+            branch(|ctx| async move {
+                let job = ctx.execute_activity("start_job", copied.clone()).await?;
+                ctx.execute_activity("poll_job", job).await
+            }),
+            branch(|ctx| async move {
+                let resp = ctx.execute_activity("make_api_call", json!({})).await?;
+                ctx.execute_activity("process_response", resp).await
+            }),
+        ]).await?;
+        // results[0] = branch A result, results[1] = branch B result
+
+        Ok(json!(results))
+    })
+}
+```
+
+If any branch fails, remaining branches are aborted and the error is returned.
+
+**Typed variants** return heterogeneous tuples — each branch can produce a different output type:
+
+```rust
+let (job_result, api_result): (JobOutput, ApiOutput) = ctx
+    .concurrently_2(
+        |ctx| async move { ctx.execute_activity_typed("start_job", &input).await },
+        |ctx| async move { ctx.execute_activity_typed("make_api_call", &req).await },
+    )
+    .await?;
+```
+
+`concurrently_3` and `concurrently_4` extend the same pattern to 3 and 4 branches.
+
+**Collecting all results including failures** — use `try_concurrently` to avoid fail-fast behaviour:
+
+```rust
+let results: Vec<Result<Value>> = ctx.try_concurrently(vec![
+    branch(|ctx| async move { ctx.execute_activity("step_a", json!({})).await }),
+    branch(|ctx| async move { ctx.execute_activity("step_b", json!({})).await }),
+]).await?;
+let successes = results.iter().filter(|r| r.is_ok()).count();
+```
+
+#### Deterministic replay
+
+Each branch is allocated a contiguous block of `BRANCH_BUDGET` (1000) sequence IDs. The block ranges are computed from the same call-counter state that governs the rest of the workflow, so on replay the same ranges are always reconstructed and each branch finds its cached history entries. A `ConcurrentBranchesStarted` event is written to the log at the fork point for observability.
+
+**Budget limit**: a branch that performs more than 1000 total operations (activities + sleeps + inner `concurrently` forks) returns `BranchBudgetExceeded`. Call `concurrently` from the root workflow context rather than nesting it deeply within another branch to avoid consuming the budget.
+
 ### Versioning
 
 `ctx.get_version()` enables safe workflow code changes while runs are in-flight. On a fresh execution, `max_version` is stored and returned. On replay, the previously stored version is returned. This lets you branch on code versions without breaking in-progress runs.
@@ -602,6 +663,7 @@ Every state transition appends an immutable event. The full schema:
 | `CleanupRegistered` | When `ctx.register_cleanup()` is called |
 | `CleanupCompleted` | A cleanup activity returned `Ok` |
 | `CleanupFailed` | A cleanup activity returned `Err` or was not registered |
+| `ConcurrentBranchesStarted` | When `ctx.concurrently()` (or `concurrently_2/3/4`) forks branches |
 | `WorkflowCompleted` | Written after all cleanups finish; workflow returned `Ok` |
 | `WorkflowFailed` | Workflow returned `Err`; cleanups run first if `CleanupPolicy::Always` is set, otherwise skipped |
 | `WorkflowCancelled` | Written after all cleanups finish; workflow was cancelled |
@@ -625,13 +687,29 @@ This is also why `sequence_id` is distinct from `sequence`: `sequence` is the gl
 
 ### Parallel activities and ID pre-allocation
 
-`execute_activities_parallel` atomically pre-allocates `n` sequence IDs (one per branch) before spawning any tasks. This ensures that even though branches run concurrently, each has a deterministic, stable ID for replay regardless of which branch completes first.
+`execute_activities_parallel` atomically pre-allocates `n` sequence IDs (one per activity) before spawning any tasks. This ensures that even though branches run concurrently, each has a deterministic, stable ID for replay regardless of which branch completes first.
 
 ```
 execute_activities_parallel([("fetch_user", ...), ("fetch_orders", ...)])
   → atomically increments counter by 2, allocating sequence_id 4 and 5
   → spawns two concurrent tasks, each using its pre-allocated ID
   → on replay: each branch independently replays from its own stable ID
+```
+
+### Concurrent branches and ID budgets
+
+`concurrently` uses a stride-based allocation: it claims `1 + n × BRANCH_BUDGET` IDs atomically — 1 for a fork-marker and `BRANCH_BUDGET` (1000) per branch. Each branch receives a `BranchContext` with its own local counter starting at 0, plus a fixed `branch_base` offset.
+
+```
+ctx.concurrently([branch_a, branch_b])   (counter at 7 before the call)
+  → fork_seq = 7         (1 ID for ConcurrentBranchesStarted marker)
+  → block_base = 8       (2 × 1000 IDs claimed from counter → counter now at 2008)
+  → branch_a: sequence_ids 8..1007    (branch_base=8,    local_counter 0..999)
+  → branch_b: sequence_ids 1008..2007 (branch_base=1008, local_counter 0..999)
+
+On replay, the counter reaches 7 after the same prior calls, so the same
+block_base and branch_base values are always produced — each branch finds
+its ActivityCompleted events at the same stable IDs.
 ```
 
 ### Version markers do not consume sequence IDs
@@ -787,7 +865,8 @@ Emitted metrics:
 | `ActivityNotFound(name)` | `ctx.execute_activity("name", ...)` called but no activity with that name is registered. | Fix the name string or register the activity. |
 | `WorkflowNotFound(name)` | `engine.start_workflow("name", ...)` called with an unregistered name. | Fix the name string or register the workflow. |
 | `VersionConflict { change_id, stored, min, max }` | The stored version marker for `change_id` is outside `[min, max]`. The running code is too far ahead of or behind the persisted version. | Widen the `[min, max]` range in `get_version()` to include `stored`. |
-| `TaskPanicked(msg)` | A Tokio task spawned by `execute_activities_parallel` panicked. | Investigate the panic in the task. Prefer `?` over `unwrap` in activity code. |
+| `TaskPanicked(msg)` | A Tokio task spawned by `execute_activities_parallel` or `concurrently` panicked. | Investigate the panic in the task. Prefer `?` over `unwrap` in activity code. |
+| `BranchBudgetExceeded { budget }` | A concurrent branch performed more than `BRANCH_BUDGET` (1000) total operations. | Reduce branch complexity, or call `concurrently` from the root workflow context rather than nesting it inside another branch. |
 | `RunNotFound(run_id)` | `engine.cancel_workflow(run_id)` called but no active context exists for that ID (run already completed or was never started). | Check the run status before cancelling. |
 | `ScheduleNotFound(name)` | `pause_schedule` or `resume_schedule` called for an unknown schedule name. | Verify the schedule name or call `list_schedules()` to enumerate registered schedules. |
 | `InvalidSchedule(msg)` | An invalid cron expression was passed to `schedule_workflow`. | Fix the cron expression. Format: `sec min hour dom month dow`. |
@@ -898,7 +977,8 @@ The dispatch loop holds a `Semaphore` to bound concurrent workflow executions. E
 - **Activity registry** — activities are registered by name and looked up from the context; no manual construction needed
 - **Automatic retries with exponential backoff** — configurable `max_attempts` and `retry_base_delay` per activity
 - **Activity timeouts** — optional per-activity execution deadline via `Activity::timeout()`
-- **Parallel activities** — `ctx.execute_activities_parallel()` for concurrent fan-out with deterministic replay
+- **Parallel activities** — `ctx.execute_activities_parallel()` for concurrent fan-out of individual activities with deterministic replay
+- **Concurrent branches** — `ctx.concurrently()` / `ctx.try_concurrently()` / `ctx.concurrently_2/3/4()` for running entire multi-step workflow sequences in parallel; each branch has its own `WorkflowContext` with a pre-allocated sequence-ID range; crash-safe and fully replayable; `branch()` helper for ergonomic closure boxing
 - **Durable timers** — `ctx.sleep(duration)` and `ctx.sleep_until(datetime)` survive process crashes
 - **Versioning** — `ctx.get_version(change_id, min, max)` for safe workflow code changes with in-flight runs
 - **Crash recovery** — in-flight workflows detected and resumed on engine startup

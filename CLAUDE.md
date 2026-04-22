@@ -30,6 +30,15 @@ engine.start_workflow(name, input)
           → on new: persist ActivityScheduled → retry loop (with optional timeout) → persist ActivityCompleted/ActivityErrored
       → ctx.execute_activities_parallel(vec![("a", input), ("b", input)])
           → pre-allocates sequence_ids → runs all branches concurrently → each branch replays independently
+      → ctx.concurrently(vec![branch(|ctx| async { ... }), branch(|ctx| async { ... })])
+          → claims 1 fork-marker sequence_id + n × BRANCH_BUDGET (1000) IDs from main counter
+          → persists ConcurrentBranchesStarted event (skipped on replay if already present)
+          → creates n BranchContexts, each with its own local counter + fixed branch_base offset
+          → runs all branches as concurrent tokio tasks (each receives its own BranchContext)
+          → each branch uses branch_base + local_counter as sequence_id for its activities
+          → fail-fast: first branch error aborts the rest; try_concurrently collects all results
+          → concurrently_2/3/4 typed variants return tuples with heterogeneous output types
+          → on replay: same counter state → same branch_base values → branches find cached history entries
       → ctx.sleep(duration)
           → on replay: returns immediately if TimerFired in history
           → on new: persist TimerStarted → sleep → persist TimerFired
@@ -57,12 +66,12 @@ On engine startup, `list_running_workflows()` finds any in-progress runs and rep
 - **`traits.rs`** — `Workflow`, `Activity`, `Storage` traits. All user-defined logic implements these.
 - **`typed.rs`** — `TypedWorkflow`, `TypedActivity` traits with associated `Input`/`Output` types. Blanket impls auto-generate the untyped `Workflow`/`Activity` implementations, handling serde at the boundary.
 - **`event.rs`** — `WorkflowEvent`/`EventPayload` enum — the immutable event log schema.
-- **`context.rs`** — `WorkflowContext` (passed to `Workflow::run`) provides `execute_activity()`, `execute_activities_parallel()`, `sleep()`/`sleep_until()`, `get_version()`, `register_cleanup()`, cancellation support, determinism helpers (`is_replaying()`, `workflow_start_time()`), and shared workflow state (`set_shared_state`/`shared_state`). `ActivityContext` carries run metadata and optional shared state from the workflow. Maintains internal replay cache keyed by call sequence number. Activities are looked up by name from the registry. Typed convenience methods (`execute_activity_typed`, etc.) wrap the Value-based API with auto-serde.
+- **`context.rs`** — `WorkflowContext` (passed to `Workflow::run`) provides `execute_activity()`, `execute_activities_parallel()`, `concurrently()` / `try_concurrently()` / `concurrently_2/3/4()`, `sleep()`/`sleep_until()`, `get_version()`, `register_cleanup()`, cancellation support, determinism helpers (`is_replaying()`, `workflow_start_time()`), and shared workflow state (`set_shared_state`/`shared_state`). `ActivityContext` carries run metadata and optional shared state from the workflow. Maintains internal replay cache keyed by call sequence number. Activities are looked up by name from the registry. Typed convenience methods (`execute_activity_typed`, etc.) wrap the Value-based API with auto-serde. **Branch mode**: contexts spawned by `concurrently` carry a `branch_counter` + `branch_base` that replace the global `call_counter` for sequence ID allocation, keeping each branch's IDs in a fixed, non-overlapping range (`BRANCH_BUDGET = 1000` IDs per branch). The public `branch()` helper boxes closures for `concurrently`.
 - **`engine.rs`** — `WorkflowEngineBuilder` + `WorkflowEngine`. Manages workflow/activity registration, dispatch loop, recovery on startup, concurrency via semaphore, `cancel_workflow()`, `list_runs()`, cleanup policy (`cleanup_policy(CleanupPolicy)`), and typed variants (`start_workflow_typed`, `get_run_result`, `get_run_result_typed`).
 - **`worker.rs`** — `WorkerTask` executes a single workflow run end-to-end. Runs registered cleanups (LIFO, failures tolerated) before writing `WorkflowCompleted` or `WorkflowCancelled`. With `CleanupPolicy::Always`, also runs cleanups before `WorkflowFailed`. Defines `CleanupPolicy` enum.
 - **`storage/sqlite.rs`** — SQLite backend (WAL mode). Two tables: `workflow_runs` (metadata + status) and `workflow_events` (append-only event log).
 - **`metrics.rs`** — Optional metrics instrumentation behind the `metrics` Cargo feature.
-- **`error.rs`** — `ZdflowError` enum covering storage, serialization, execution, cancellation, and engine lifecycle errors. Specific variants for `ActivityTimedOut`, `VersionConflict`, `TaskPanicked`, `InvalidSchedule`, `RunNotFound`, `ScheduleNotFound`; `Other(String)` is reserved for truly unexpected errors.
+- **`error.rs`** — `ZdflowError` enum covering storage, serialization, execution, cancellation, and engine lifecycle errors. Specific variants for `ActivityTimedOut`, `VersionConflict`, `TaskPanicked`, `InvalidSchedule`, `RunNotFound`, `ScheduleNotFound`, `BranchBudgetExceeded`; `Other(String)` is reserved for truly unexpected errors.
 
 ### Deterministic Replay Invariant
 
@@ -79,13 +88,13 @@ Activities retry with exponential backoff (default: 3 attempts, 1s base delay). 
 
 ### Test Coverage
 
-`tests/integration.rs` covers (23 tests as of this writing):
+`tests/integration.rs` covers (33 tests as of this writing):
 
 | Feature | Tests |
 |---------|-------|
 | Basic workflow execution (success, failure) | ✓ |
 | Activity execution, retries, timeout | ✓ |
-| Parallel activities | ✓ |
+| Parallel activities (`execute_activities_parallel`, fail-fast, try-parallel, heterogeneous types) | ✓ |
 | Durable sleep + cancellation | ✓ |
 | Versioning (`get_version`) | ✓ |
 | Typed workflows and activities | ✓ |
@@ -95,3 +104,4 @@ Activities retry with exponential backoff (default: 3 attempts, 1s base delay). 
 | **Cleanup / finalizers** (success, cancel, fail, LIFO order, CleanupPolicy::Always, failing/unregistered cleanup tolerance) | ✓ |
 | **Scheduled workflows** (cron validation, list/delete, fires on tick) | ✓ |
 | **Crash recovery** (pre-populated history replayed; activity not re-executed) | ✓ |
+| **Concurrent branches** (multi-step branches, sequential-then-parallel, fail-fast, try_concurrently partial results, typed_2, sleep within branch, crash recovery) | ✓ |

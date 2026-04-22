@@ -9,7 +9,7 @@ use std::sync::Arc;
 use zdflow::{
     Activity, ActivityContext, ActivityFuture, CleanupPolicy, EventPayload, RunFilter, RunStatus,
     SqliteStorage, Storage, TypedActivity, TypedActivityFuture, TypedWorkflow, TypedWorkflowFuture,
-    Workflow, WorkflowContext, WorkflowEngine, WorkflowEvent, WorkflowFuture, ZdflowError,
+    Workflow, WorkflowContext, WorkflowEngine, WorkflowEvent, WorkflowFuture, ZdflowError, branch,
 };
 
 // ── Test activities ──────────────────────────────────────────────────────
@@ -1276,4 +1276,503 @@ async fn test_parallel_heterogeneous_types() {
     assert_eq!(result["score"], 42);
 
     handle.shutdown().await;
+}
+
+// ── concurrently tests ────────────────────────────────────────────────────
+
+// Workflow: two branches each with 2 sequential activities.
+struct ConcurrentBranchesWorkflow;
+
+impl ConcurrentBranchesWorkflow {
+    pub const NAME: &'static str = "concurrent_branches";
+}
+
+impl Workflow for ConcurrentBranchesWorkflow {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            let results = ctx
+                .concurrently(vec![
+                    // Branch A: two sequential echos
+                    branch(|ctx| async move {
+                        let r1 = ctx
+                            .execute_activity(EchoActivity::NAME, json!({"branch": "a", "step": 1}))
+                            .await?;
+                        let r2 = ctx
+                            .execute_activity(EchoActivity::NAME, json!({"branch": "a", "step": 2}))
+                            .await?;
+                        Ok(json!({"a1": r1, "a2": r2}))
+                    }),
+                    // Branch B: two sequential echos
+                    branch(|ctx| async move {
+                        let r1 = ctx
+                            .execute_activity(EchoActivity::NAME, json!({"branch": "b", "step": 1}))
+                            .await?;
+                        let r2 = ctx
+                            .execute_activity(EchoActivity::NAME, json!({"branch": "b", "step": 2}))
+                            .await?;
+                        Ok(json!({"b1": r1, "b2": r2}))
+                    }),
+                ])
+                .await?;
+            Ok(json!(results))
+        })
+    }
+}
+
+// Workflow: sequential activity → two parallel branches (the user's example).
+struct SequentialThenConcurrentWorkflow;
+
+impl SequentialThenConcurrentWorkflow {
+    pub const NAME: &'static str = "seq_then_concurrent";
+}
+
+impl Workflow for SequentialThenConcurrentWorkflow {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            // First: copy the file (sequential)
+            let copied = ctx
+                .execute_activity(EchoActivity::NAME, json!({"action": "copy", "file": input["file"]}))
+                .await?;
+
+            // Then: two parallel branches — start job AND make API call
+            let (job_result, api_result): (Value, Value) = ctx
+                .concurrently_2(
+                    move |ctx| {
+                        let copied = copied.clone();
+                        async move {
+                            ctx.execute_activity(EchoActivity::NAME, json!({"action": "start_job", "file": copied}))
+                                .await
+                        }
+                    },
+                    |ctx| async move {
+                        ctx.execute_activity(EchoActivity::NAME, json!({"action": "api_call"}))
+                            .await
+                    },
+                )
+                .await?;
+
+            Ok(json!({"job": job_result, "api": api_result}))
+        })
+    }
+}
+
+// Workflow: one branch fails; the other should be aborted.
+struct ConcurrentFailFastWorkflow;
+
+impl ConcurrentFailFastWorkflow {
+    pub const NAME: &'static str = "concurrent_fail_fast";
+}
+
+impl Workflow for ConcurrentFailFastWorkflow {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            ctx.concurrently(vec![
+                branch(|ctx| async move {
+                    ctx.execute_activity(EchoActivity::NAME, json!({"id": 1})).await
+                }),
+                branch(|ctx| async move {
+                    ctx.execute_activity(FailActivity::NAME, json!({})).await
+                }),
+            ])
+            .await?;
+            Ok(json!("should not reach here"))
+        })
+    }
+}
+
+// Workflow: try_concurrently collects both success and failure.
+struct TryConcurrentWorkflow;
+
+impl TryConcurrentWorkflow {
+    pub const NAME: &'static str = "try_concurrent";
+}
+
+impl Workflow for TryConcurrentWorkflow {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            let results = ctx
+                .try_concurrently(vec![
+                    branch(|ctx| async move {
+                        ctx.execute_activity(EchoActivity::NAME, json!({"id": 1})).await
+                    }),
+                    branch(|ctx| async move {
+                        ctx.execute_activity(FailActivity::NAME, json!({})).await
+                    }),
+                    branch(|ctx| async move {
+                        ctx.execute_activity(EchoActivity::NAME, json!({"id": 3})).await
+                    }),
+                ])
+                .await?;
+
+            let successes = results.iter().filter(|r| r.is_ok()).count() as u32;
+            let failures = results.iter().filter(|r| r.is_err()).count() as u32;
+            Ok(json!({"successes": successes, "failures": failures}))
+        })
+    }
+}
+
+// Workflow: typed concurrently_2 with heterogeneous output types.
+struct ConcurrentTyped2Workflow;
+
+impl ConcurrentTyped2Workflow {
+    pub const NAME: &'static str = "concurrent_typed_2";
+}
+
+impl Workflow for ConcurrentTyped2Workflow {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            let (person, score): (PersonData, ScoreData) = ctx
+                .concurrently_2(
+                    |ctx| async move {
+                        ctx.execute_activity_typed(EchoActivity::NAME, &json!({"name": "Bob"}))
+                            .await
+                    },
+                    |ctx| async move {
+                        ctx.execute_activity_typed(EchoActivity::NAME, &json!({"score": 99u32}))
+                            .await
+                    },
+                )
+                .await?;
+            Ok(json!({"name": person.name, "score": score.score}))
+        })
+    }
+}
+
+// Workflow: branch with activity + short sleep + activity.
+struct ConcurrentWithSleepWorkflow;
+
+impl ConcurrentWithSleepWorkflow {
+    pub const NAME: &'static str = "concurrent_with_sleep";
+}
+
+impl Workflow for ConcurrentWithSleepWorkflow {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            let results = ctx
+                .concurrently(vec![
+                    // Branch A: activity → tiny sleep → activity
+                    branch(|ctx| async move {
+                        let r1 = ctx
+                            .execute_activity(EchoActivity::NAME, json!({"step": "before_sleep"}))
+                            .await?;
+                        ctx.sleep(Duration::from_millis(1)).await?;
+                        let r2 = ctx
+                            .execute_activity(EchoActivity::NAME, json!({"step": "after_sleep"}))
+                            .await?;
+                        Ok(json!({"r1": r1, "r2": r2}))
+                    }),
+                    // Branch B: single activity
+                    branch(|ctx| async move {
+                        ctx.execute_activity(EchoActivity::NAME, json!({"step": "fast"})).await
+                    }),
+                ])
+                .await?;
+            Ok(json!(results))
+        })
+    }
+}
+
+async fn build_concurrent_engine() -> WorkflowEngine {
+    let storage = SqliteStorage::open(":memory:").await.unwrap();
+    WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(ConcurrentBranchesWorkflow)
+        .register_workflow(SequentialThenConcurrentWorkflow)
+        .register_workflow(ConcurrentFailFastWorkflow)
+        .register_workflow(TryConcurrentWorkflow)
+        .register_workflow(ConcurrentTyped2Workflow)
+        .register_workflow(ConcurrentWithSleepWorkflow)
+        .register_activity(EchoActivity)
+        .register_activity(FailActivity)
+        .max_concurrent_workflows(10)
+        .build()
+        .await
+        .unwrap()
+}
+
+/// Two branches each containing 2 sequential activities run concurrently
+/// and both results are returned in order.
+#[tokio::test]
+async fn test_concurrent_branches_basic() {
+    let mut engine = build_concurrent_engine().await;
+    let handle = engine.run().await.unwrap();
+
+    let run_id = engine
+        .start_workflow(ConcurrentBranchesWorkflow::NAME, json!({}))
+        .await
+        .unwrap();
+
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+
+    let result = engine.get_run_result(run_id).await.unwrap().unwrap();
+    // result is [[{...branch_a...}, {...branch_b...}]]
+    assert_eq!(result[0]["a1"]["branch"], "a");
+    assert_eq!(result[0]["a1"]["step"], 1);
+    assert_eq!(result[0]["a2"]["branch"], "a");
+    assert_eq!(result[0]["a2"]["step"], 2);
+    assert_eq!(result[1]["b1"]["branch"], "b");
+    assert_eq!(result[1]["b2"]["branch"], "b");
+
+    handle.shutdown().await;
+}
+
+/// The user's example: copy file (sequential) → then start_job AND api_call (parallel).
+#[tokio::test]
+async fn test_concurrent_branches_sequential_then_parallel() {
+    let mut engine = build_concurrent_engine().await;
+    let handle = engine.run().await.unwrap();
+
+    let run_id = engine
+        .start_workflow(
+            SequentialThenConcurrentWorkflow::NAME,
+            json!({"file": "data.csv"}),
+        )
+        .await
+        .unwrap();
+
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+
+    let result = engine.get_run_result(run_id).await.unwrap().unwrap();
+    assert_eq!(result["job"]["action"], "start_job");
+    assert_eq!(result["api"]["action"], "api_call");
+
+    handle.shutdown().await;
+}
+
+/// If one branch fails, concurrently aborts the rest and returns the error.
+#[tokio::test]
+async fn test_concurrent_branches_fail_fast() {
+    let mut engine = build_concurrent_engine().await;
+    let handle = engine.run().await.unwrap();
+
+    let run_id = engine
+        .start_workflow(ConcurrentFailFastWorkflow::NAME, json!({}))
+        .await
+        .unwrap();
+
+    wait_for_status(&engine, run_id, RunStatus::Failed).await;
+    handle.shutdown().await;
+}
+
+/// try_concurrently collects all results without short-circuiting.
+#[tokio::test]
+async fn test_try_concurrent_partial_results() {
+    let mut engine = build_concurrent_engine().await;
+    let handle = engine.run().await.unwrap();
+
+    let run_id = engine
+        .start_workflow(TryConcurrentWorkflow::NAME, json!({}))
+        .await
+        .unwrap();
+
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+
+    let result = engine.get_run_result(run_id).await.unwrap().unwrap();
+    assert_eq!(result["successes"], 2, "two branches should succeed");
+    assert_eq!(result["failures"], 1, "one branch should fail");
+
+    handle.shutdown().await;
+}
+
+/// concurrently_2 returns a typed tuple with different output types per branch.
+#[tokio::test]
+async fn test_concurrent_branches_typed_2() {
+    let mut engine = build_concurrent_engine().await;
+    let handle = engine.run().await.unwrap();
+
+    let run_id = engine
+        .start_workflow(ConcurrentTyped2Workflow::NAME, json!({}))
+        .await
+        .unwrap();
+
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+
+    let result = engine.get_run_result(run_id).await.unwrap().unwrap();
+    assert_eq!(result["name"], "Bob");
+    assert_eq!(result["score"], 99);
+
+    handle.shutdown().await;
+}
+
+/// A branch containing both an activity and a sleep completes correctly.
+#[tokio::test]
+async fn test_concurrent_branches_with_sleep() {
+    let mut engine = build_concurrent_engine().await;
+    let handle = engine.run().await.unwrap();
+
+    let run_id = engine
+        .start_workflow(ConcurrentWithSleepWorkflow::NAME, json!({}))
+        .await
+        .unwrap();
+
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+
+    let result = engine.get_run_result(run_id).await.unwrap().unwrap();
+    assert_eq!(result[0]["r1"]["step"], "before_sleep");
+    assert_eq!(result[0]["r2"]["step"], "after_sleep");
+    assert_eq!(result[1]["step"], "fast");
+
+    handle.shutdown().await;
+}
+
+/// Crash recovery: pre-populate history with a completed first branch activity
+/// and verify the second branch activity is executed live while the first is replayed.
+#[tokio::test]
+async fn test_concurrent_branches_crash_recovery() {
+    use zdflow::{BRANCH_BUDGET, EventPayload, WorkflowEvent};
+    use chrono::Utc;
+
+    let db_path = format!("/tmp/zdflow_concurrent_recovery_{}.db", Uuid::new_v4());
+    let storage = SqliteStorage::open(&db_path).await.unwrap();
+
+    // Pre-create a run for ConcurrentBranchesWorkflow.
+    let run_id = Uuid::new_v4();
+    storage
+        .create_run(run_id, ConcurrentBranchesWorkflow::NAME, &json!({}))
+        .await
+        .unwrap();
+
+    // The workflow calls concurrently with 2 branches (BRANCH_BUDGET IDs each).
+    // Counter before fork: 0 → fork_seq = 0, block_base = 1.
+    // Branch A base = 1, Branch B base = 1 + BRANCH_BUDGET.
+    // Branch A step 1 → seq_id = 1 (branch_base=1, local=0)
+    // Branch A step 2 → seq_id = 2 (branch_base=1, local=1)
+    // Branch B step 1 → seq_id = 1+BRANCH_BUDGET
+    // Branch B step 2 → seq_id = 2+BRANCH_BUDGET
+
+    let branch_b_base = 1 + BRANCH_BUDGET;
+
+    let mut seq: u64 = 0;
+    let mut push = |payload: EventPayload| {
+        seq += 1;
+        WorkflowEvent {
+            sequence: seq,
+            occurred_at: Utc::now(),
+            payload,
+        }
+    };
+
+    // WorkflowStarted
+    storage
+        .append_event(
+            run_id,
+            &push(EventPayload::WorkflowStarted {
+                workflow_name: ConcurrentBranchesWorkflow::NAME.to_string(),
+                input: json!({}),
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Fork marker (fork_seq=0)
+    storage
+        .append_event(
+            run_id,
+            &push(EventPayload::ConcurrentBranchesStarted {
+                sequence_id: 0,
+                num_branches: 2,
+                branch_budget: BRANCH_BUDGET,
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Branch A step 1 completed (seq_id = 1)
+    storage
+        .append_event(
+            run_id,
+            &push(EventPayload::ActivityScheduled {
+                sequence_id: 1,
+                activity_name: EchoActivity::NAME.to_string(),
+                input: json!({"branch": "a", "step": 1}),
+            }),
+        )
+        .await
+        .unwrap();
+    storage
+        .append_event(
+            run_id,
+            &push(EventPayload::ActivityCompleted {
+                sequence_id: 1,
+                output: json!({"branch": "a", "step": 1}),
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Branch B step 1 completed (seq_id = branch_b_base + 0)
+    storage
+        .append_event(
+            run_id,
+            &push(EventPayload::ActivityScheduled {
+                sequence_id: branch_b_base,
+                activity_name: EchoActivity::NAME.to_string(),
+                input: json!({"branch": "b", "step": 1}),
+            }),
+        )
+        .await
+        .unwrap();
+    storage
+        .append_event(
+            run_id,
+            &push(EventPayload::ActivityCompleted {
+                sequence_id: branch_b_base,
+                output: json!({"branch": "b", "step": 1}),
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Drop storage so the engine can open it
+    drop(storage);
+
+    // Boot the engine — it will recover the in-progress run and replay.
+    let storage2 = SqliteStorage::open(&db_path).await.unwrap();
+    let mut engine = WorkflowEngine::builder()
+        .with_storage(storage2)
+        .register_workflow(ConcurrentBranchesWorkflow)
+        .register_activity(EchoActivity)
+        .max_concurrent_workflows(10)
+        .build()
+        .await
+        .unwrap();
+
+    let handle = engine.run().await.unwrap();
+
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+    handle.shutdown().await;
+
+    // Verify result is correct (both branches completed).
+    let storage3 = SqliteStorage::open(&db_path).await.unwrap();
+    let result = storage3.get_run_result(run_id).await.unwrap().unwrap();
+    assert_eq!(result[0]["a1"]["branch"], "a", "branch A step 1 from history");
+    assert_eq!(result[1]["b1"]["branch"], "b", "branch B step 1 from history");
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(format!("{}-shm", &db_path));
+    let _ = std::fs::remove_file(format!("{}-wal", &db_path));
 }
