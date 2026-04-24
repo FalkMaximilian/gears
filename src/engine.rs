@@ -359,6 +359,16 @@ impl WorkflowEngine {
         self.storage.list_schedules().await
     }
 
+    /// Names of all registered workflows.
+    pub fn workflow_names(&self) -> Vec<String> {
+        self.workflows.keys().cloned().collect()
+    }
+
+    /// Names of all registered activities.
+    pub fn activity_names(&self) -> Vec<String> {
+        self.activities.keys().cloned().collect()
+    }
+
     /// Permanently remove a schedule. In-flight runs are not affected.
     pub async fn delete_schedule(&self, name: &str) -> Result<()> {
         if let Some(uuid) = self.job_handles.lock().await.remove(name) {

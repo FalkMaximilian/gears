@@ -5,13 +5,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-cargo build                  # Debug build
-cargo build --release        # Release build
-cargo test                   # Run all tests
-cargo test <test_name>       # Run a single test
-cargo run                    # Run the demo HTTP server (port 3000)
-cargo fmt                    # Format code
-cargo clippy                 # Lint
+cargo build                        # Debug build
+cargo build --release              # Release build
+cargo test                         # Run all tests
+cargo test <test_name>             # Run a single test
+cargo run --bin gears-demo         # Run the demo HTTP server (port 3000)
+cargo run --bin gears-ctl          # Run the TUI controller (connects to localhost:3000)
+cargo run --bin gears-ctl -- --url http://host:3000  # Custom engine URL
+cargo fmt                          # Format code
+cargo clippy                       # Lint
 ```
 
 ## Architecture
@@ -67,11 +69,13 @@ On engine startup, `list_running_workflows()` finds any in-progress runs and rep
 - **`typed.rs`** — `TypedWorkflow`, `TypedActivity` traits with associated `Input`/`Output` types. Blanket impls auto-generate the untyped `Workflow`/`Activity` implementations, handling serde at the boundary.
 - **`event.rs`** — `WorkflowEvent`/`EventPayload` enum — the immutable event log schema.
 - **`context.rs`** — `WorkflowContext` (passed to `Workflow::run`) provides `execute_activity()`, `execute_activities_parallel()`, `concurrently()` / `try_concurrently()` / `concurrently_2/3/4()`, `sleep()`/`sleep_until()`, `get_version()`, `register_cleanup()`, cancellation support, determinism helpers (`is_replaying()`, `workflow_start_time()`), and shared workflow state (`set_shared_state`/`shared_state`). `ActivityContext` carries run metadata and optional shared state from the workflow. Maintains internal replay cache keyed by call sequence number. Activities are looked up by name from the registry. Typed convenience methods (`execute_activity_typed`, etc.) wrap the Value-based API with auto-serde. **Branch mode**: contexts spawned by `concurrently` carry a `branch_counter` + `branch_base` that replace the global `call_counter` for sequence ID allocation, keeping each branch's IDs in a fixed, non-overlapping range (`BRANCH_BUDGET = 1000` IDs per branch). The public `branch()` helper boxes closures for `concurrently`.
-- **`engine.rs`** — `WorkflowEngineBuilder` + `WorkflowEngine`. Manages workflow/activity registration, dispatch loop, recovery on startup, concurrency via semaphore, `cancel_workflow()`, `list_runs()`, cleanup policy (`cleanup_policy(CleanupPolicy)`), and typed variants (`start_workflow_typed`, `get_run_result`, `get_run_result_typed`).
+- **`engine.rs`** — `WorkflowEngineBuilder` + `WorkflowEngine`. Manages workflow/activity registration, dispatch loop, recovery on startup, concurrency via semaphore, `cancel_workflow()`, `list_runs()`, `workflow_names()`, `activity_names()`, cleanup policy (`cleanup_policy(CleanupPolicy)`), and typed variants (`start_workflow_typed`, `get_run_result`, `get_run_result_typed`).
+- **`api.rs`** — `management_router()` returns an Axum `Router<Arc<WorkflowEngine>>` with REST endpoints for all engine management operations. Mount it with `.nest("/api", management_router())`. Endpoints: `GET /runs`, `GET /runs/{id}`, `POST /runs/{id}/cancel`, `GET /schedules`, `POST /schedules`, `DELETE /schedules/{name}`, `POST /schedules/{name}/pause`, `POST /schedules/{name}/resume`, `GET /workflows`, `GET /activities`.
 - **`worker.rs`** — `WorkerTask` executes a single workflow run end-to-end. Runs registered cleanups (LIFO, failures tolerated) before writing `WorkflowCompleted` or `WorkflowCancelled`. With `CleanupPolicy::Always`, also runs cleanups before `WorkflowFailed`. Defines `CleanupPolicy` enum.
 - **`storage/sqlite.rs`** — SQLite backend (WAL mode). Two tables: `workflow_runs` (metadata + status) and `workflow_events` (append-only event log).
 - **`metrics.rs`** — Optional metrics instrumentation behind the `metrics` Cargo feature.
 - **`error.rs`** — `GearsError` enum covering storage, serialization, execution, cancellation, and engine lifecycle errors. Specific variants for `ActivityTimedOut`, `VersionConflict`, `TaskPanicked`, `InvalidSchedule`, `RunNotFound`, `ScheduleNotFound`, `BranchBudgetExceeded`; `Other(String)` is reserved for truly unexpected errors.
+- **`src/bin/gears-ctl/`** — Standalone TUI controller binary (`gears-ctl`). Connects to the management API over HTTP. Four files: `main.rs` (event loop, terminal setup), `app.rs` (state + actions), `client.rs` (reqwest API client), `ui.rs` (ratatui rendering). Key bindings: `Tab` switch tab, `↑↓` navigate, `c` cancel run, `p` pause/resume schedule, `d` delete schedule, `r` refresh, `q` quit.
 
 ### Deterministic Replay Invariant
 

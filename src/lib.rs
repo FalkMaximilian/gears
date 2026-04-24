@@ -1,3 +1,4 @@
+pub mod api;
 pub mod context;
 pub mod engine;
 pub mod error;
@@ -9,6 +10,7 @@ pub mod typed;
 pub mod worker;
 
 // Public re-exports for library users.
+pub use api::management_router;
 pub use context::{ActivityContext, BranchFn, BranchFuture, WorkflowContext, branch, BRANCH_BUDGET};
 pub use engine::{EngineHandle, WorkflowEngine, WorkflowEngineBuilder};
 pub use worker::CleanupPolicy;

@@ -4,16 +4,21 @@
 //! Test: curl -X POST http://localhost:3000/greet \
 //!            -H 'Content-Type: application/json' \
 //!            -d '{"name": "Alice"}'
+//!
+//! Management API (via gears-ctl or curl):
+//!   curl http://localhost:3000/api/runs
+//!   curl http://localhost:3000/api/schedules
+//!   curl http://localhost:3000/api/workflows
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::Json,
-    routing::{get, post},
+    routing::post,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,6 +26,7 @@ use serde_json::{Value, json};
 use gears::{
     Activity, ActivityContext, ActivityFuture, SqliteStorage, TypedActivity, TypedActivityFuture,
     TypedWorkflow, TypedWorkflowFuture, Workflow, WorkflowContext, WorkflowEngine, WorkflowFuture,
+    management_router,
 };
 
 // ── Activity: send a greeting ─────────────────────────────────────────────
@@ -39,7 +45,6 @@ impl Activity for SendGreetingActivity {
     fn execute(&self, ctx: ActivityContext, input: Value) -> ActivityFuture {
         Box::pin(async move {
             let name = input["name"].as_str().unwrap_or("stranger");
-            // Simulate some external I/O.
             tokio::time::sleep(Duration::from_millis(50)).await;
             let message = format!("Hello, {}! (attempt #{})", name, ctx.attempt);
             println!("[activity] {}", message);
@@ -63,18 +68,14 @@ impl Workflow for GreetingWorkflow {
 
     fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture {
         Box::pin(async move {
-            // First greeting.
             let result1 = ctx
                 .execute_activity(SendGreetingActivity::NAME, input.clone())
                 .await?;
             println!("[workflow] first greeting: {:?}", result1["message"]);
 
-            // Durable sleep — if the process crashes here and restarts,
-            // the workflow resumes with only the remaining time left.
             ctx.sleep(Duration::from_secs(2)).await?;
             println!("[workflow] woke up after sleep");
 
-            // Second greeting.
             let result2 = ctx
                 .execute_activity(SendGreetingActivity::NAME, input.clone())
                 .await?;
@@ -89,10 +90,6 @@ impl Workflow for GreetingWorkflow {
 }
 
 // ── Activity: allocate a resource ────────────────────────────────────────
-//
-// Simulates starting a long-running process on a third-party system
-// (e.g. a cloud VM or a batch job). Returns a handle that can be used
-// to cancel/release the resource.
 
 struct AllocateResourceActivity;
 
@@ -140,9 +137,6 @@ impl Activity for ReleaseResourceActivity {
 }
 
 // ── Workflow: allocate resource with automatic cleanup ────────────────────
-//
-// Demonstrates ctx.register_cleanup: the release activity runs automatically
-// when the workflow completes successfully OR is cancelled.
 
 struct ResourceWorkflow;
 
@@ -157,13 +151,10 @@ impl Workflow for ResourceWorkflow {
 
     fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture {
         Box::pin(async move {
-            // Allocate the resource.
             let alloc = ctx
                 .execute_activity(AllocateResourceActivity::NAME, input.clone())
                 .await?;
 
-            // Register cleanup immediately after allocation. This runs even if
-            // the workflow is cancelled during the sleep below.
             ctx.register_cleanup(
                 ReleaseResourceActivity::NAME,
                 json!({ "handle": alloc["handle"] }),
@@ -201,10 +192,6 @@ impl Workflow for HeartbeatWorkflow {
 }
 
 // ── Typed workflow demo: order processing ────────────────────────────────
-//
-// Demonstrates TypedWorkflow, TypedActivity, shared state, and
-// execute_activity_typed. One struct (OrderInput) is shared across the
-// entire workflow; activities read it via shared state or typed input.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderInput {
@@ -231,7 +218,6 @@ impl TypedActivity for ConfirmOrderActivity {
 
     fn execute(&self, ctx: ActivityContext, _input: ()) -> TypedActivityFuture<bool> {
         Box::pin(async move {
-            // Read the shared workflow state — no explicit input needed.
             let order: OrderInput = ctx.shared_state()?;
             tokio::time::sleep(Duration::from_millis(30)).await;
             println!(
@@ -285,17 +271,11 @@ impl TypedWorkflow for OrderWorkflow {
 
     fn run(&self, ctx: WorkflowContext, input: OrderInput) -> TypedWorkflowFuture<OrderOutput> {
         Box::pin(async move {
-            // Set shared state once — all activities can read it.
             ctx.set_shared_state(&input)?;
-
-            // confirm_order reads shared state, no per-call input.
             let confirmed: bool = ctx.execute_activity_typed("confirm_order", &()).await?;
-
-            // notify_customer receives the full struct.
             let message: String = ctx
                 .execute_activity_typed("notify_customer", &input)
                 .await?;
-
             Ok(OrderOutput {
                 order_id: input.order_id,
                 confirmed,
@@ -313,14 +293,30 @@ struct GreetRequest {
 }
 
 #[derive(Serialize)]
-struct GreetResponse {
+struct RunResponse {
     run_id: String,
+}
+
+async fn start_greeting(
+    State(engine): State<Arc<WorkflowEngine>>,
+    Json(payload): Json<GreetRequest>,
+) -> std::result::Result<Json<RunResponse>, StatusCode> {
+    let run_id = engine
+        .start_workflow("greeting", json!({ "name": payload.name }))
+        .await
+        .map_err(|e| {
+            tracing::error!("failed to start workflow: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(RunResponse {
+        run_id: run_id.to_string(),
+    }))
 }
 
 async fn start_resource_workflow(
     State(engine): State<Arc<WorkflowEngine>>,
     Json(payload): Json<serde_json::Value>,
-) -> std::result::Result<Json<GreetResponse>, StatusCode> {
+) -> std::result::Result<Json<RunResponse>, StatusCode> {
     let resource = payload["resource"].as_str().unwrap_or("default-resource");
     let run_id = engine
         .start_workflow(ResourceWorkflow::NAME, json!({ "resource": resource }))
@@ -329,25 +325,7 @@ async fn start_resource_workflow(
             tracing::error!("failed to start resource workflow: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-
-    Ok(Json(GreetResponse {
-        run_id: run_id.to_string(),
-    }))
-}
-
-async fn start_greeting(
-    State(engine): State<Arc<WorkflowEngine>>,
-    Json(payload): Json<GreetRequest>,
-) -> std::result::Result<Json<GreetResponse>, StatusCode> {
-    let run_id = engine
-        .start_workflow("greeting", json!({ "name": payload.name }))
-        .await
-        .map_err(|e| {
-            tracing::error!("failed to start workflow: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    Ok(Json(GreetResponse {
+    Ok(Json(RunResponse {
         run_id: run_id.to_string(),
     }))
 }
@@ -355,7 +333,7 @@ async fn start_greeting(
 async fn start_order(
     State(engine): State<Arc<WorkflowEngine>>,
     Json(payload): Json<OrderInput>,
-) -> std::result::Result<Json<GreetResponse>, StatusCode> {
+) -> std::result::Result<Json<RunResponse>, StatusCode> {
     let run_id = engine
         .start_workflow_typed("order", &payload)
         .await
@@ -363,66 +341,9 @@ async fn start_order(
             tracing::error!("failed to start order workflow: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-
-    Ok(Json(GreetResponse {
+    Ok(Json(RunResponse {
         run_id: run_id.to_string(),
     }))
-}
-
-// ── Schedule handlers ─────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct ScheduleResponse {
-    name: String,
-    cron_expression: String,
-    workflow_name: String,
-    status: String,
-    last_fired_at: Option<String>,
-}
-
-async fn list_schedules_handler(
-    State(engine): State<Arc<WorkflowEngine>>,
-) -> std::result::Result<Json<Vec<ScheduleResponse>>, StatusCode> {
-    let schedules = engine.list_schedules().await.map_err(|e| {
-        tracing::error!("failed to list schedules: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let resp = schedules
-        .into_iter()
-        .map(|s| ScheduleResponse {
-            name: s.name,
-            cron_expression: s.cron_expression,
-            workflow_name: s.workflow_name,
-            status: match s.status {
-                gears::ScheduleStatus::Active => "active".into(),
-                gears::ScheduleStatus::Paused => "paused".into(),
-            },
-            last_fired_at: s.last_fired_at.map(|t| t.to_rfc3339()),
-        })
-        .collect();
-    Ok(Json(resp))
-}
-
-async fn pause_schedule_handler(
-    State(engine): State<Arc<WorkflowEngine>>,
-    Path(name): Path<String>,
-) -> std::result::Result<StatusCode, StatusCode> {
-    engine.pause_schedule(&name).await.map_err(|e| {
-        tracing::error!(schedule = %name, "failed to pause schedule: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn resume_schedule_handler(
-    State(engine): State<Arc<WorkflowEngine>>,
-    Path(name): Path<String>,
-) -> std::result::Result<StatusCode, StatusCode> {
-    engine.resume_schedule(&name).await.map_err(|e| {
-        tracing::error!(schedule = %name, "failed to resume schedule: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────
@@ -452,7 +373,6 @@ async fn main() -> anyhow::Result<()> {
 
     let engine_handle = engine.run().await?;
 
-    // Register a heartbeat schedule that fires every 30 seconds.
     engine
         .schedule_workflow(
             "heartbeat-30s",
@@ -469,23 +389,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/greet", post(start_greeting))
         .route("/resource", post(start_resource_workflow))
         .route("/order", post(start_order))
-        .route("/schedules", get(list_schedules_handler))
-        .route("/schedules/{name}/pause", post(pause_schedule_handler))
-        .route("/schedules/{name}/resume", post(resume_schedule_handler))
+        .nest("/api", management_router())
         .with_state(engine.clone());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
     println!("Listening on http://localhost:3000");
-    println!(
-        "Try: curl -X POST http://localhost:3000/greet -H 'Content-Type: application/json' -d '{{\"name\": \"Alice\"}}'"
-    );
-    println!("     curl http://localhost:3000/schedules");
-    println!(
-        "     curl -X POST http://localhost:3000/resource -H 'Content-Type: application/json' -d '{{\"resource\": \"my-vm\"}}'"
-    );
-    println!(
-        "     curl -X POST http://localhost:3000/order -H 'Content-Type: application/json' -d '{{\"order_id\": \"ORD-1\", \"customer\": \"Alice\"}}'"
-    );
+    println!("Management API: http://localhost:3000/api/runs");
+    println!("TUI controller: cargo run --bin gears-ctl");
 
     tokio::select! {
         result = axum::serve(listener, app) => { result?; }

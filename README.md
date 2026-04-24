@@ -716,17 +716,98 @@ its ActivityCompleted events at the same stable IDs.
 
 `get_version` is keyed by its `change_id` string, not by sequence position. This means inserting a `get_version` call anywhere in the workflow does not shift the sequence IDs of any surrounding `execute_activity` or `sleep` calls, making it safe to add version checks to workflows that have in-flight runs.
 
+## Management API
+
+Any application embedding gears can expose a built-in REST management API. Mount `management_router()` under a prefix in your Axum router:
+
+```rust
+use gears::management_router;
+
+let app = Router::new()
+    // ... your application routes ...
+    .nest("/api", management_router())
+    .with_state(Arc::new(engine));
+```
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/runs` | List runs. Query params: `status`, `workflow_name`, `limit`, `offset` |
+| `GET` | `/api/runs/{id}` | Run detail including result JSON |
+| `POST` | `/api/runs/{id}/cancel` | Cancel a running workflow |
+| `GET` | `/api/schedules` | List all cron schedules |
+| `POST` | `/api/schedules` | Create or update a schedule |
+| `DELETE` | `/api/schedules/{name}` | Delete a schedule |
+| `POST` | `/api/schedules/{name}/pause` | Pause a schedule |
+| `POST` | `/api/schedules/{name}/resume` | Resume a paused schedule |
+| `GET` | `/api/workflows` | List registered workflow names |
+| `GET` | `/api/activities` | List registered activity names |
+
+```bash
+# Example: list the last 10 completed runs
+curl 'http://localhost:3000/api/runs?status=completed&limit=10'
+
+# Cancel a run
+curl -X POST http://localhost:3000/api/runs/<run_id>/cancel
+
+# Create a schedule
+curl -X POST http://localhost:3000/api/schedules \
+     -H 'Content-Type: application/json' \
+     -d '{"name":"daily","cron_expression":"0 0 9 * * Mon-Fri","workflow_name":"report","input":{}}'
+
+# Pause/resume a schedule
+curl -X POST http://localhost:3000/api/schedules/daily/pause
+curl -X POST http://localhost:3000/api/schedules/daily/resume
+```
+
+## gears-ctl — TUI controller
+
+`gears-ctl` is a standalone terminal UI for monitoring and managing a running gears engine. It connects to the management API over HTTP and auto-refreshes every 2 seconds.
+
+```bash
+cargo run --bin gears-ctl                          # connect to localhost:3000
+cargo run --bin gears-ctl -- --url http://host:3000  # custom URL
+cargo run --bin gears-ctl -- --interval 5          # refresh every 5 seconds
+```
+
+```
+╔═ Gears Controller ══════════════════════════════════════════╗
+║  Runs  │  Schedules                                          ║
+╠══════════╦═══════════════╦══════════════╦════════════════════╣
+║ Status   ║ Workflow      ║ Run ID       ║ Updated            ║
+╠══════════╬═══════════════╬══════════════╬════════════════════╣
+║ ● running║ greeting      ║ 3a4b5c6d…   ║ 2026-04-22T…       ║
+║ ✓ comp.. ║ order         ║ 1a2b3c4d…   ║ 2026-04-22T…       ║
+║ ✗ failed ║ heartbeat     ║ 7f8e9d0c…   ║ 2026-04-22T…       ║
+╚══════════╩═══════════════╩══════════════╩════════════════════╝
+ ↑↓ Navigate  c Cancel  r Refresh  Tab Switch  q Quit
+```
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Navigate list |
+| `Tab` | Switch between Runs and Schedules |
+| `c` | Cancel the selected running workflow |
+| `p` | Pause or resume the selected schedule |
+| `d` | Delete the selected schedule |
+| `r` | Manual refresh |
+| `q` / `Esc` | Quit |
+
 ## Getting started
 
 ```bash
 # Run the demo HTTP server
-cargo run
+cargo run --bin gears-demo
 
-# In another terminal
+# In another terminal — start a workflow
 curl -X POST http://localhost:3000/greet \
      -H 'Content-Type: application/json' \
      -d '{"name": "Alice"}'
 # Returns: {"run_id": "<uuid>"}
+
+# Or launch the TUI controller
+cargo run --bin gears-ctl
 ```
 
 The demo runs a `GreetingWorkflow` that executes an activity, sleeps 2 seconds, then executes the activity again. Kill the process during the sleep, restart it, and the workflow resumes with only the remaining time left.
@@ -943,17 +1024,24 @@ Tests use an in-memory SQLite database (`SqliteStorage::open(":memory:")`), so n
 
 ```
 src/
-├── lib.rs          Public API surface and re-exports
-├── main.rs         Demo application (Axum HTTP server)
-├── traits.rs       Workflow, Activity, Storage trait definitions
-├── typed.rs        TypedWorkflow, TypedActivity traits and blanket impls
-├── event.rs        WorkflowEvent and EventPayload types
-├── context.rs      WorkflowContext (replay engine, shared state) and ActivityContext
-├── engine.rs       WorkflowEngineBuilder, WorkflowEngine, dispatch loop
-├── worker.rs       WorkerTask — executes one workflow run end-to-end
-├── metrics.rs      Optional metrics instrumentation (behind `metrics` feature)
-└── storage/
-    └── sqlite.rs   SQLiteStorage implementation (WAL mode, bundled SQLite)
+├── lib.rs              Public API surface and re-exports
+├── main.rs             Demo application (Axum HTTP server + management API)
+├── api.rs              management_router() — REST control plane
+├── traits.rs           Workflow, Activity, Storage trait definitions
+├── typed.rs            TypedWorkflow, TypedActivity traits and blanket impls
+├── event.rs            WorkflowEvent and EventPayload types
+├── context.rs          WorkflowContext (replay engine, shared state) and ActivityContext
+├── engine.rs           WorkflowEngineBuilder, WorkflowEngine, dispatch loop
+├── worker.rs           WorkerTask — executes one workflow run end-to-end
+├── metrics.rs          Optional metrics instrumentation (behind `metrics` feature)
+├── storage/
+│   └── sqlite.rs       SqliteStorage implementation (WAL mode, bundled SQLite)
+└── bin/
+    └── gears-ctl/
+        ├── main.rs     TUI entry point (event loop, terminal setup)
+        ├── app.rs      App state and actions
+        ├── client.rs   HTTP client for the management API
+        └── ui.rs       ratatui rendering
 ```
 
 ```mermaid
@@ -965,6 +1053,10 @@ graph LR
     Context --> Storage
     Worker --> Storage
     Engine --> Storage
+    Engine --> API["api.rs\nmanagement_router()"]
+    API --> HTTP["HTTP /api/*"]
+    HTTP --> TUI["gears-ctl\n(ratatui TUI)"]
+    HTTP --> Web["Web frontend\n(future)"]
 
     Storage["Storage\n(dyn trait)"] --> SQLite["SqliteStorage\n(default)"]
 ```
@@ -997,6 +1089,8 @@ The dispatch loop holds a `Semaphore` to bound concurrent workflow executions. E
 - **Shared workflow state** — `ctx.set_shared_state(&vars)` propagates common data (trace IDs, user context) to all activities via `ctx.shared_state::<T>()`
 - **Typed convenience methods** — `execute_activity_typed`, `start_workflow_typed`, `get_run_result_typed` for compile-time type safety without manual serde
 - **Metrics** — optional Prometheus-compatible counters/gauges/histograms via `metrics` crate (feature-gated)
+- **Management REST API** — `management_router()` provides a drop-in Axum router covering runs, schedules, registered workflows/activities; embed it in any Axum application with `.nest("/api", management_router())`
+- **gears-ctl TUI** — standalone terminal controller (`cargo run --bin gears-ctl`); live run and schedule monitoring with keyboard-driven cancel/pause/resume/delete; auto-refreshes every 2 seconds; configurable `--url` and `--interval`
 
 ## Limitations and known gaps
 
