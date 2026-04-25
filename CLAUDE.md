@@ -12,6 +12,10 @@ cargo test <test_name>             # Run a single test
 cargo run --bin gears-demo         # Run the demo HTTP server (port 3000)
 cargo run --bin gears-ctl          # Run the TUI controller (connects to localhost:3000)
 cargo run --bin gears-ctl -- --url http://host:3000  # Custom engine URL
+
+# gears-demo endpoints
+# http://localhost:3000/swagger-ui  — interactive OpenAPI browser (Swagger UI)
+# http://localhost:3000/api/openapi.json  — raw OpenAPI 3.1 spec
 cargo fmt                          # Format code
 cargo clippy                       # Lint
 ```

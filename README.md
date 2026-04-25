@@ -784,7 +784,29 @@ let spec: utoipa::openapi::OpenApi = openapi_spec();
 let json = serde_json::to_string_pretty(&spec)?;
 ```
 
-Point any OpenAPI-compatible tool (Swagger UI, Redoc, Postman) at `/api/openapi.json` to get an interactive explorer for the management API.
+### Swagger UI
+
+The demo server (`gears-demo`) ships with an embedded [Swagger UI](https://swagger.io/tools/swagger-ui/) at `GET /swagger-ui`. Open it in a browser to explore and call all management API endpoints interactively.
+
+To add Swagger UI to your own Axum application, add the dependency:
+
+```toml
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+```
+
+Then mount it after `with_state` (since it is stateless):
+
+```rust
+use gears::{management_router, openapi_spec};
+use utoipa_swagger_ui::SwaggerUi;
+
+let app = Router::new()
+    .nest("/api", management_router())
+    .with_state(Arc::new(engine))
+    .merge(SwaggerUi::new("/swagger-ui").url("/swagger-ui/openapi.json", openapi_spec()));
+```
+
+> **Note**: use a path like `/swagger-ui/openapi.json` for the spec URL — not `/api/openapi.json` — to avoid a route conflict with the spec endpoint already registered by `management_router()`.
 
 ## gears-ctl — TUI controller
 
@@ -829,6 +851,9 @@ curl -X POST http://localhost:3000/greet \
      -H 'Content-Type: application/json' \
      -d '{"name": "Alice"}'
 # Returns: {"run_id": "<uuid>"}
+
+# Open the interactive API browser
+open http://localhost:3000/swagger-ui
 
 # Or launch the TUI controller
 cargo run --bin gears-ctl
@@ -1114,6 +1139,8 @@ The dispatch loop holds a `Semaphore` to bound concurrent workflow executions. E
 - **Typed convenience methods** — `execute_activity_typed`, `start_workflow_typed`, `get_run_result_typed` for compile-time type safety without manual serde
 - **Metrics** — optional Prometheus-compatible counters/gauges/histograms via `metrics` crate (feature-gated)
 - **Management REST API** — `management_router()` provides a drop-in Axum router covering runs, schedules, registered workflows/activities; embed it in any Axum application with `.nest("/api", management_router())`
+- **OpenAPI 3.1 spec** — generated at compile time via `utoipa`; served at `GET /api/openapi.json`; also available as `openapi_spec()` for programmatic use
+- **Swagger UI** — embedded interactive API browser at `/swagger-ui` in `gears-demo`; add to any Axum app via `utoipa-swagger-ui`
 - **gears-ctl TUI** — standalone terminal controller (`cargo run --bin gears-ctl`); live run and schedule monitoring with keyboard-driven cancel/pause/resume/delete; auto-refreshes every 2 seconds; configurable `--url` and `--interval`
 
 ## Limitations and known gaps

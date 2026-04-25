@@ -9,6 +9,10 @@
 //!   curl http://localhost:3000/api/runs
 //!   curl http://localhost:3000/api/schedules
 //!   curl http://localhost:3000/api/workflows
+//!
+//! OpenAPI:
+//!   Swagger UI: http://localhost:3000/swagger-ui
+//!   Raw spec:   http://localhost:3000/api/openapi.json
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,8 +30,9 @@ use serde_json::{Value, json};
 use gears::{
     Activity, ActivityContext, ActivityFuture, SqliteStorage, TypedActivity, TypedActivityFuture,
     TypedWorkflow, TypedWorkflowFuture, Workflow, WorkflowContext, WorkflowEngine, WorkflowFuture,
-    management_router,
+    management_router, openapi_spec,
 };
+use utoipa_swagger_ui::SwaggerUi;
 
 // ── Activity: send a greeting ─────────────────────────────────────────────
 
@@ -390,11 +395,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/resource", post(start_resource_workflow))
         .route("/order", post(start_order))
         .nest("/api", management_router())
-        .with_state(engine.clone());
+        .with_state(engine.clone())
+        .merge(SwaggerUi::new("/swagger-ui").url("/swagger-ui/openapi.json", openapi_spec()));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
     println!("Listening on http://localhost:3000");
     println!("Management API: http://localhost:3000/api/runs");
+    println!("Swagger UI:     http://localhost:3000/swagger-ui");
     println!("TUI controller: cargo run --bin gears-ctl");
 
     tokio::select! {
