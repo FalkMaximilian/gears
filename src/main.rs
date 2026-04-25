@@ -13,6 +13,16 @@
 //! OpenAPI:
 //!   Swagger UI: http://localhost:3000/swagger-ui
 //!   Raw spec:   http://localhost:3000/api/openapi.json
+//!
+//! Configuration (gears-demo.toml or GEARS_* env vars):
+//!   log_level              — tracing filter (default: "gears=debug,info")
+//!   database_url           — SQLite path    (default: "gears-demo.db")
+//!   port                   — listen port    (default: 3000)
+//!   swagger_ui             — enable UI      (default: true)
+//!   max_concurrent_workflows — concurrency  (default: 50)
+//!
+//! Example overrides:
+//!   GEARS_PORT=8080 GEARS_SWAGGER_UI=false cargo run --bin gears-demo
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +36,41 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+// ── Configuration ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    /// Tracing filter directive (e.g. "gears=debug,info")
+    log_level: String,
+    /// SQLite database path
+    database_url: String,
+    /// TCP port to listen on
+    port: u16,
+    /// Enable the Swagger UI at /swagger-ui
+    swagger_ui: bool,
+    /// Maximum number of concurrently executing workflows
+    max_concurrent_workflows: usize,
+}
+
+impl Config {
+    fn load() -> anyhow::Result<Self> {
+        let cfg = config::Config::builder()
+            .set_default("log_level", "gears=debug,info")?
+            .set_default("database_url", "gears-demo.db")?
+            .set_default("port", 3000)?
+            .set_default("swagger_ui", true)?
+            .set_default("max_concurrent_workflows", 50)?
+            .add_source(config::File::with_name("gears-demo").required(false))
+            .add_source(
+                config::Environment::with_prefix("GEARS")
+                    .separator("_")
+                    .ignore_empty(true),
+            )
+            .build()?;
+        Ok(cfg.try_deserialize()?)
+    }
+}
 
 use gears::{
     Activity, ActivityContext, ActivityFuture, SqliteStorage, TypedActivity, TypedActivityFuture,
@@ -355,11 +400,15 @@ async fn start_order(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cfg = Config::load()?;
+
     tracing_subscriber::fmt()
-        .with_env_filter("gears=debug,info")
+        .with_env_filter(&cfg.log_level)
         .init();
 
-    let storage = SqliteStorage::open("gears-demo.db").await?;
+    tracing::debug!(?cfg, "loaded configuration");
+
+    let storage = SqliteStorage::open(&cfg.database_url).await?;
 
     let mut engine = WorkflowEngine::builder()
         .with_storage(storage)
@@ -372,7 +421,7 @@ async fn main() -> anyhow::Result<()> {
         .register_activity(ReleaseResourceActivity)
         .register_activity(ConfirmOrderActivity)
         .register_activity(NotifyCustomerActivity)
-        .max_concurrent_workflows(50)
+        .max_concurrent_workflows(cfg.max_concurrent_workflows)
         .build()
         .await?;
 
@@ -390,18 +439,24 @@ async fn main() -> anyhow::Result<()> {
 
     let engine = Arc::new(engine);
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/greet", post(start_greeting))
         .route("/resource", post(start_resource_workflow))
         .route("/order", post(start_order))
         .nest("/api", management_router())
-        .with_state(engine.clone())
-        .merge(SwaggerUi::new("/swagger-ui").url("/swagger-ui/openapi.json", openapi_spec()));
+        .with_state(engine.clone());
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-    println!("Listening on http://localhost:3000");
-    println!("Management API: http://localhost:3000/api/runs");
-    println!("Swagger UI:     http://localhost:3000/swagger-ui");
+    if cfg.swagger_ui {
+        app = app.merge(SwaggerUi::new("/swagger-ui").url("/swagger-ui/openapi.json", openapi_spec()));
+    }
+
+    let addr = format!("0.0.0.0:{}", cfg.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    println!("Listening on http://localhost:{}", cfg.port);
+    println!("Management API: http://localhost:{}/api/runs", cfg.port);
+    if cfg.swagger_ui {
+        println!("Swagger UI:     http://localhost:{}/swagger-ui", cfg.port);
+    }
     println!("TUI controller: cargo run --bin gears-ctl");
 
     tokio::select! {

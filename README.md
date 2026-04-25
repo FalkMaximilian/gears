@@ -861,6 +861,36 @@ cargo run --bin gears-ctl
 
 The demo runs a `GreetingWorkflow` that executes an activity, sleeps 2 seconds, then executes the activity again. Kill the process during the sleep, restart it, and the workflow resumes with only the remaining time left.
 
+## Demo server configuration
+
+`gears-demo` reads its configuration from `gears-demo.toml` (optional, in the working directory). Every setting can be overridden with a `GEARS_` environment variable. Environment variables take priority over the file.
+
+| Setting | Default | Environment variable |
+|---|---|---|
+| `log_level` | `gears=debug,info` | `GEARS_LOG_LEVEL` |
+| `database_url` | `gears-demo.db` | `GEARS_DATABASE_URL` |
+| `port` | `3000` | `GEARS_PORT` |
+| `swagger_ui` | `true` | `GEARS_SWAGGER_UI` |
+| `max_concurrent_workflows` | `50` | `GEARS_MAX_CONCURRENT_WORKFLOWS` |
+
+`log_level` accepts any [`tracing-subscriber` env-filter directive](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) (e.g. `trace`, `gears=debug,info`, `gears=warn`).
+
+When `swagger_ui = false` the `/swagger-ui` routes are not mounted at all.
+
+```toml
+# gears-demo.toml — override any subset of these
+log_level = "info"
+database_url = "/var/lib/gears/demo.db"
+port = 8080
+swagger_ui = false
+max_concurrent_workflows = 100
+```
+
+```bash
+# Or use environment variables directly
+GEARS_PORT=8080 GEARS_SWAGGER_UI=false cargo run --bin gears-demo
+```
+
 ## Engine setup
 
 ```rust

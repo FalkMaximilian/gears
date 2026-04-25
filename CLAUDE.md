@@ -16,6 +16,18 @@ cargo run --bin gears-ctl -- --url http://host:3000  # Custom engine URL
 # gears-demo endpoints
 # http://localhost:3000/swagger-ui  — interactive OpenAPI browser (Swagger UI)
 # http://localhost:3000/api/openapi.json  — raw OpenAPI 3.1 spec
+
+# gears-demo configuration
+# Settings are read from gears-demo.toml (optional) then overridden by GEARS_* env vars.
+# Available settings and their defaults:
+#   log_level="gears=debug,info"   GEARS_LOG_LEVEL=...
+#   database_url="gears-demo.db"   GEARS_DATABASE_URL=...
+#   port=3000                      GEARS_PORT=...
+#   swagger_ui=true                GEARS_SWAGGER_UI=...
+#   max_concurrent_workflows=50    GEARS_MAX_CONCURRENT_WORKFLOWS=...
+#
+# Example: GEARS_PORT=8080 GEARS_SWAGGER_UI=false cargo run --bin gears-demo
+
 cargo fmt                          # Format code
 cargo clippy                       # Lint
 ```
