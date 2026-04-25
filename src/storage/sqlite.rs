@@ -25,7 +25,7 @@ impl SqliteStorage {
     /// Open (or create) a SQLite database at the given path.
     /// Use `":memory:"` for an in-memory database (useful in tests).
     pub async fn open(path: &str) -> Result<Self> {
-        let conn = Connection::open(path).await?;
+        let conn = Connection::open(path).await.map_err(|e| GearsError::Storage(tokio_rusqlite::Error::Error(e)))?;
         let storage = SqliteStorage {
             conn: Arc::new(conn),
         };

@@ -734,7 +734,9 @@ let app = Router::new()
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/runs` | List runs. Query params: `status`, `workflow_name`, `limit`, `offset` |
+| `POST` | `/api/runs` | Start a new run. Body: `{"workflow_name": "...", "input": {...}}`. Returns `{"run_id": "..."}` |
 | `GET` | `/api/runs/{id}` | Run detail including result JSON |
+| `GET` | `/api/runs/{id}/events` | Full ordered event log for a run as a JSON array |
 | `POST` | `/api/runs/{id}/cancel` | Cancel a running workflow |
 | `GET` | `/api/schedules` | List all cron schedules |
 | `POST` | `/api/schedules` | Create or update a schedule |
@@ -742,11 +744,21 @@ let app = Router::new()
 | `POST` | `/api/schedules/{name}/pause` | Pause a schedule |
 | `POST` | `/api/schedules/{name}/resume` | Resume a paused schedule |
 | `GET` | `/api/workflows` | List registered workflow names |
-| `GET` | `/api/activities` | List registered activity names |
+| `GET` | `/api/activities` | List registered activities as `ActivityInfo` objects (name, max_attempts, retry_base_delay_ms, timeout_ms) |
+| `GET` | `/api/openapi.json` | OpenAPI 3.1 spec for the management API |
 
 ```bash
 # Example: list the last 10 completed runs
 curl 'http://localhost:3000/api/runs?status=completed&limit=10'
+
+# Start a new run
+curl -X POST http://localhost:3000/api/runs \
+     -H 'Content-Type: application/json' \
+     -d '{"workflow_name":"my_workflow","input":{"key":"value"}}'
+# {"run_id": "<uuid>"}
+
+# Get the full event log for a run
+curl http://localhost:3000/api/runs/<run_id>/events
 
 # Cancel a run
 curl -X POST http://localhost:3000/api/runs/<run_id>/cancel
@@ -761,6 +773,19 @@ curl -X POST http://localhost:3000/api/schedules/daily/pause
 curl -X POST http://localhost:3000/api/schedules/daily/resume
 ```
 
+### OpenAPI spec
+
+The management API ships with an OpenAPI 3.1 spec generated at compile time via [`utoipa`](https://docs.rs/utoipa). It is served at `GET /api/openapi.json` and can also be accessed programmatically:
+
+```rust
+use gears::openapi_spec;
+
+let spec: utoipa::openapi::OpenApi = openapi_spec();
+let json = serde_json::to_string_pretty(&spec)?;
+```
+
+Point any OpenAPI-compatible tool (Swagger UI, Redoc, Postman) at `/api/openapi.json` to get an interactive explorer for the management API.
+
 ## gears-ctl — TUI controller
 
 `gears-ctl` is a standalone terminal UI for monitoring and managing a running gears engine. It connects to the management API over HTTP and auto-refreshes every 2 seconds.
@@ -771,28 +796,27 @@ cargo run --bin gears-ctl -- --url http://host:3000  # custom URL
 cargo run --bin gears-ctl -- --interval 5          # refresh every 5 seconds
 ```
 
-```
-╔═ Gears Controller ══════════════════════════════════════════╗
-║  Runs  │  Schedules                                          ║
-╠══════════╦═══════════════╦══════════════╦════════════════════╣
-║ Status   ║ Workflow      ║ Run ID       ║ Updated            ║
-╠══════════╬═══════════════╬══════════════╬════════════════════╣
-║ ● running║ greeting      ║ 3a4b5c6d…   ║ 2026-04-22T…       ║
-║ ✓ comp.. ║ order         ║ 1a2b3c4d…   ║ 2026-04-22T…       ║
-║ ✗ failed ║ heartbeat     ║ 7f8e9d0c…   ║ 2026-04-22T…       ║
-╚══════════╩═══════════════╩══════════════╩════════════════════╝
- ↑↓ Navigate  c Cancel  r Refresh  Tab Switch  q Quit
-```
+Three tabs are available:
+
+- **Runs** — list of all workflow runs with status, name, run ID, duration, and last-updated time. Press `Enter` to open the event timeline for the selected run.
+- **Schedules** — list of cron schedules with expression, status, and last-fired time.
+- **Registered** — split view: registered workflows on the left, registered activities with their retry config (max attempts, base delay, timeout) on the right. Press `n` to trigger a new run from a selected workflow.
 
 | Key | Action |
 |-----|--------|
-| `↑` / `↓` | Navigate list |
-| `Tab` | Switch between Runs and Schedules |
+| `↑` / `↓` | Navigate list or scroll event log in detail view |
+| `Tab` / `Shift+Tab` | Cycle tabs |
+| `Enter` | Open run detail (event timeline) — Runs tab |
+| `Esc` | Close detail / exit filter / exit input mode |
 | `c` | Cancel the selected running workflow |
 | `p` | Pause or resume the selected schedule |
 | `d` | Delete the selected schedule |
+| `/` | Filter runs by workflow name (live substring) — Runs tab |
+| `f` | Cycle status filter: all → running → completed → failed → cancelled |
+| `n` | Trigger a new run with inline JSON input — Registered tab |
+| `y` | Copy selected run ID to clipboard (macOS: `pbcopy`) |
 | `r` | Manual refresh |
-| `q` / `Esc` | Quit |
+| `q` | Quit |
 
 ## Getting started
 
