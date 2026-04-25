@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// One entry in the durable event log for a workflow run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct WorkflowEvent {
     /// Monotonically increasing position within this run's event log.
     pub sequence: u64,
@@ -11,12 +11,13 @@ pub struct WorkflowEvent {
 }
 
 /// All possible state transitions for a workflow run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventPayload {
     /// Run was created and its input was recorded.
     WorkflowStarted {
         workflow_name: String,
+        #[schema(value_type = Object)]
         input: serde_json::Value,
     },
 
@@ -26,12 +27,14 @@ pub enum EventPayload {
         /// `execute_activity` or `sleep`. Used as the replay key.
         sequence_id: u32,
         activity_name: String,
+        #[schema(value_type = Object)]
         input: serde_json::Value,
     },
 
     /// Activity completed successfully.
     ActivityCompleted {
         sequence_id: u32,
+        #[schema(value_type = Object)]
         output: serde_json::Value,
     },
 
@@ -78,6 +81,7 @@ pub enum EventPayload {
     CleanupRegistered {
         sequence_id: u32,
         activity_name: String,
+        #[schema(value_type = Object)]
         input: serde_json::Value,
     },
 
@@ -103,7 +107,10 @@ pub enum EventPayload {
     WorkflowCancelled { reason: String },
 
     /// Workflow function returned successfully.
-    WorkflowCompleted { output: serde_json::Value },
+    WorkflowCompleted {
+        #[schema(value_type = Object)]
+        output: serde_json::Value,
+    },
 
     /// Workflow function returned an error.
     WorkflowFailed { error: String },

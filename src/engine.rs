@@ -12,10 +12,22 @@ use uuid::Uuid;
 use crate::context::WorkflowContext;
 use crate::error::{Result, GearsError};
 use crate::metrics;
+use crate::event::WorkflowEvent;
 use crate::traits::{
     Activity, RunFilter, RunInfo, RunStatus, ScheduleRecord, ScheduleStatus, Storage, Workflow,
 };
 use crate::worker::{CleanupPolicy, WorkerTask};
+
+// ── Public metadata types ─────────────────────────────────────────────────
+
+/// Metadata about a registered activity, returned by [`WorkflowEngine::activity_info_list`].
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct ActivityInfo {
+    pub name: String,
+    pub max_attempts: u32,
+    pub retry_base_delay_ms: u64,
+    pub timeout_ms: Option<u64>,
+}
 
 // ── Internal message types ────────────────────────────────────────────────
 
@@ -297,6 +309,17 @@ impl WorkflowEngine {
         }
     }
 
+    /// Retrieve the full event log for a run, ordered by sequence.
+    /// Returns `GearsError::RunNotFound` if the run does not exist.
+    pub async fn get_run_events(&self, run_id: Uuid) -> Result<Vec<WorkflowEvent>> {
+        let filter = RunFilter { ..Default::default() };
+        let runs = self.storage.list_runs(&filter).await?;
+        if runs.iter().all(|r| r.run_id != run_id) {
+            return Err(GearsError::RunNotFound(run_id));
+        }
+        self.storage.load_events(run_id).await
+    }
+
     // ── Scheduled workflows ───────────────────────────────────────────────
 
     /// Register (or update) a named cron schedule. `cron_expression` must be
@@ -367,6 +390,22 @@ impl WorkflowEngine {
     /// Names of all registered activities.
     pub fn activity_names(&self) -> Vec<String> {
         self.activities.keys().cloned().collect()
+    }
+
+    /// Metadata for all registered activities (name, retry config, timeout).
+    pub fn activity_info_list(&self) -> Vec<ActivityInfo> {
+        let mut list: Vec<ActivityInfo> = self
+            .activities
+            .values()
+            .map(|a| ActivityInfo {
+                name: a.name().to_string(),
+                max_attempts: a.max_attempts(),
+                retry_base_delay_ms: a.retry_base_delay().as_millis() as u64,
+                timeout_ms: a.timeout().map(|d| d.as_millis() as u64),
+            })
+            .collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        list
     }
 
     /// Permanently remove a schedule. In-flight runs are not affected.

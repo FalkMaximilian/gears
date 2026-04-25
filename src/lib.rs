@@ -10,9 +10,9 @@ pub mod typed;
 pub mod worker;
 
 // Public re-exports for library users.
-pub use api::management_router;
+pub use api::{management_router, openapi_spec};
 pub use context::{ActivityContext, BranchFn, BranchFuture, WorkflowContext, branch, BRANCH_BUDGET};
-pub use engine::{EngineHandle, WorkflowEngine, WorkflowEngineBuilder};
+pub use engine::{ActivityInfo, EngineHandle, WorkflowEngine, WorkflowEngineBuilder};
 pub use worker::CleanupPolicy;
 pub use error::{Result, GearsError};
 pub use event::{EventPayload, WorkflowEvent};
