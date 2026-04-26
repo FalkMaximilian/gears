@@ -33,6 +33,13 @@ pub trait Workflow: Send + Sync + 'static {
     /// Entry point. `ctx` provides `execute_activity` and `sleep`.
     /// `input` is the JSON payload passed to `engine.start_workflow`.
     fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture;
+
+    /// Optional retention period for completed/failed/cancelled runs of this
+    /// workflow type. Overrides the engine-level global retention when `Some`.
+    /// `None` (default) falls back to the engine's global `retention_days`.
+    fn retention(&self) -> Option<Duration> {
+        None
+    }
 }
 
 // ── Activity ──────────────────────────────────────────────────────────────
@@ -177,6 +184,10 @@ pub trait Storage: Send + Sync + 'static {
 
     /// List runs matching the given filter criteria.
     fn list_runs(&self, filter: &RunFilter) -> StorageFuture<Vec<RunInfo>>;
+
+    /// Permanently delete a workflow run and all its events.
+    /// If the run does not exist this is a no-op.
+    fn delete_run(&self, run_id: Uuid) -> StorageFuture<()>;
 
     // ── Schedule persistence ──────────────────────────────────────────────
 

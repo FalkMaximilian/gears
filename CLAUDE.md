@@ -25,6 +25,7 @@ cargo run --bin gears-ctl -- --url http://host:3000  # Custom engine URL
 #   port=3000                      GEARS_PORT=...
 #   swagger_ui=true                GEARS_SWAGGER_UI=...
 #   max_concurrent_workflows=50    GEARS_MAX_CONCURRENT_WORKFLOWS=...
+#   retention_days=(unset)         GEARS_RETENTION_DAYS=...  # omit to keep runs forever
 #
 # Example: GEARS_PORT=8080 GEARS_SWAGGER_UI=false cargo run --bin gears-demo
 
@@ -85,7 +86,7 @@ On engine startup, `list_running_workflows()` finds any in-progress runs and rep
 - **`typed.rs`** — `TypedWorkflow`, `TypedActivity` traits with associated `Input`/`Output` types. Blanket impls auto-generate the untyped `Workflow`/`Activity` implementations, handling serde at the boundary.
 - **`event.rs`** — `WorkflowEvent`/`EventPayload` enum — the immutable event log schema.
 - **`context.rs`** — `WorkflowContext` (passed to `Workflow::run`) provides `execute_activity()`, `execute_activities_parallel()`, `concurrently()` / `try_concurrently()` / `concurrently_2/3/4()`, `sleep()`/`sleep_until()`, `get_version()`, `register_cleanup()`, cancellation support, determinism helpers (`is_replaying()`, `workflow_start_time()`), and shared workflow state (`set_shared_state`/`shared_state`). `ActivityContext` carries run metadata and optional shared state from the workflow. Maintains internal replay cache keyed by call sequence number. Activities are looked up by name from the registry. Typed convenience methods (`execute_activity_typed`, etc.) wrap the Value-based API with auto-serde. **Branch mode**: contexts spawned by `concurrently` carry a `branch_counter` + `branch_base` that replace the global `call_counter` for sequence ID allocation, keeping each branch's IDs in a fixed, non-overlapping range (`BRANCH_BUDGET = 1000` IDs per branch). The public `branch()` helper boxes closures for `concurrently`.
-- **`engine.rs`** — `WorkflowEngineBuilder` + `WorkflowEngine`. Manages workflow/activity registration, dispatch loop, recovery on startup, concurrency via semaphore, `cancel_workflow()`, `list_runs()`, `get_run_events()`, `workflow_names()`, `activity_names()`, `activity_info_list()`, cleanup policy (`cleanup_policy(CleanupPolicy)`), and typed variants (`start_workflow_typed`, `get_run_result`, `get_run_result_typed`). `ActivityInfo` struct carries per-activity metadata (name, max_attempts, retry_base_delay_ms, timeout_ms).
+- **`engine.rs`** — `WorkflowEngineBuilder` + `WorkflowEngine`. Manages workflow/activity registration, dispatch loop, recovery on startup, concurrency via semaphore, `cancel_workflow()`, `list_runs()`, `get_run_events()`, `workflow_names()`, `activity_names()`, `activity_info_list()`, cleanup policy (`cleanup_policy(CleanupPolicy)`), and typed variants (`start_workflow_typed`, `get_run_result`, `get_run_result_typed`). `ActivityInfo` struct carries per-activity metadata (name, max_attempts, retry_base_delay_ms, timeout_ms). `RetentionPolicy` controls automatic deletion of terminal runs: global via `retention_days(u32)` on the builder; per-workflow via `Workflow::retention() -> Option<Duration>` (overrides global when `Some`). A background hourly Tokio task runs `run_pruning_pass` and deletes expired runs; it starts only when at least one retention period is configured and shuts down cleanly via `EngineHandle::shutdown()`.
 - **`api.rs`** — `management_router()` returns an Axum `Router<Arc<WorkflowEngine>>` with REST endpoints for all engine management operations. Mount it with `.nest("/api", management_router())`. Endpoints: `GET /runs`, `POST /runs` (start a run; body: `{workflow_name, input}`; returns `{run_id}`), `GET /runs/{id}`, `GET /runs/{id}/events` (full ordered event log as JSON array), `POST /runs/{id}/cancel`, `GET /schedules`, `POST /schedules`, `DELETE /schedules/{name}`, `POST /schedules/{name}/pause`, `POST /schedules/{name}/resume`, `GET /workflows`, `GET /activities` (returns `ActivityInfo` objects, not just names), `GET /openapi.json` (OpenAPI 3.1 spec). All request/response types carry `#[derive(utoipa::ToSchema)]`; the spec is generated at compile time via `GearsApiDoc` and served on each request. `openapi_spec() -> utoipa::openapi::OpenApi` is also exported from the library root for programmatic use.
 - **`worker.rs`** — `WorkerTask` executes a single workflow run end-to-end. Runs registered cleanups (LIFO, failures tolerated) before writing `WorkflowCompleted` or `WorkflowCancelled`. With `CleanupPolicy::Always`, also runs cleanups before `WorkflowFailed`. Defines `CleanupPolicy` enum.
 - **`storage/sqlite.rs`** — SQLite backend (WAL mode). Two tables: `workflow_runs` (metadata + status) and `workflow_events` (append-only event log).
@@ -121,7 +122,7 @@ Activities retry with exponential backoff (default: 3 attempts, 1s base delay). 
 
 ### Test Coverage
 
-`tests/integration.rs` covers (33 tests as of this writing):
+`tests/integration.rs` covers (37 tests as of this writing):
 
 | Feature | Tests |
 |---------|-------|
@@ -138,3 +139,4 @@ Activities retry with exponential backoff (default: 3 attempts, 1s base delay). 
 | **Scheduled workflows** (cron validation, list/delete, fires on tick) | ✓ |
 | **Crash recovery** (pre-populated history replayed; activity not re-executed) | ✓ |
 | **Concurrent branches** (multi-step branches, sequential-then-parallel, fail-fast, try_concurrently partial results, typed_2, sleep within branch, crash recovery) | ✓ |
+| **Retention pruning** (global retention, per-workflow priority, recent runs preserved, running workflows never pruned) | ✓ |

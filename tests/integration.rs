@@ -7,9 +7,10 @@ use uuid::Uuid;
 use std::sync::Arc;
 
 use gears::{
-    Activity, ActivityContext, ActivityFuture, CleanupPolicy, EventPayload, RunFilter, RunStatus,
-    SqliteStorage, Storage, TypedActivity, TypedActivityFuture, TypedWorkflow, TypedWorkflowFuture,
-    Workflow, WorkflowContext, WorkflowEngine, WorkflowEvent, WorkflowFuture, GearsError, branch,
+    Activity, ActivityContext, ActivityFuture, CleanupPolicy, EventPayload, RetentionPolicy,
+    RunFilter, RunStatus, SqliteStorage, Storage, TypedActivity, TypedActivityFuture, TypedWorkflow,
+    TypedWorkflowFuture, Workflow, WorkflowContext, WorkflowEngine, WorkflowEvent, WorkflowFuture,
+    GearsError, branch,
 };
 
 // ── Test activities ──────────────────────────────────────────────────────
@@ -1775,4 +1776,133 @@ async fn test_concurrent_branches_crash_recovery() {
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_file(format!("{}-shm", &db_path));
     let _ = std::fs::remove_file(format!("{}-wal", &db_path));
+}
+
+// ── Retention pruning ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn retention_policy_effective_for_priority() {
+    // Pure unit test — no engine needed.
+    let policy = RetentionPolicy { global_days: Some(30) };
+
+    // Per-workflow Some overrides global.
+    let seven_days = Duration::from_secs(7 * 86_400);
+    assert_eq!(policy.effective_for(Some(seven_days)), Some(seven_days));
+
+    // Per-workflow None falls back to global.
+    assert_eq!(
+        policy.effective_for(None),
+        Some(Duration::from_secs(30 * 86_400))
+    );
+
+    // Both None → no pruning.
+    let no_policy = RetentionPolicy { global_days: None };
+    assert_eq!(no_policy.effective_for(None), None);
+}
+
+#[tokio::test]
+async fn retention_prunes_expired_completed_run() {
+    let db_path = format!("/tmp/gears-ret-expired-{}.db", Uuid::new_v4());
+
+    // Phase 1: create and complete a run using a real engine.
+    let storage = SqliteStorage::open(&db_path).await.unwrap();
+    let mut engine = WorkflowEngine::builder()
+        .with_storage(storage.clone())
+        .register_workflow(NullWorkflow)
+        .register_activity(EchoActivity)
+        .retention_days(1)
+        .build()
+        .await
+        .unwrap();
+    let handle = engine.run().await.unwrap();
+    let run_id = engine.start_workflow("null_wf", json!({})).await.unwrap();
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+    handle.shutdown().await;
+
+    // Backdate the run so it appears 2 days old.
+    storage.backdate_run(run_id, 2).await;
+
+    // Phase 2: rebuild engine (same storage) and trigger pruning.
+    let mut engine2 = WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(NullWorkflow)
+        .register_activity(EchoActivity)
+        .retention_days(1)
+        .build()
+        .await
+        .unwrap();
+    let handle2 = engine2.run().await.unwrap();
+    engine2.prune_now().await;
+
+    assert_eq!(
+        engine2.get_run_status(run_id).await.unwrap(),
+        RunStatus::NotFound,
+        "expired run should be deleted"
+    );
+    handle2.shutdown().await;
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(format!("{}-shm", &db_path));
+    let _ = std::fs::remove_file(format!("{}-wal", &db_path));
+}
+
+#[tokio::test]
+async fn retention_does_not_prune_recent_run() {
+    let storage = SqliteStorage::open(":memory:").await.unwrap();
+    let mut engine = WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(NullWorkflow)
+        .register_activity(EchoActivity)
+        .retention_days(30)
+        .build()
+        .await
+        .unwrap();
+    let handle = engine.run().await.unwrap();
+    let run_id = engine.start_workflow("null_wf", json!({})).await.unwrap();
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+
+    engine.prune_now().await;
+
+    assert_eq!(
+        engine.get_run_status(run_id).await.unwrap(),
+        RunStatus::Completed,
+        "recent run should not be pruned"
+    );
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn retention_does_not_prune_running_workflows() {
+    let storage = SqliteStorage::open(":memory:").await.unwrap();
+    let mut engine = WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(SleepyWorkflow)
+        .register_activity(EchoActivity)
+        .retention_days(0)
+        .build()
+        .await
+        .unwrap();
+    let handle = engine.run().await.unwrap();
+
+    // Start a workflow that will sleep (remain Running).
+    let run_id = engine
+        .start_workflow(SleepyWorkflow::NAME, json!({}))
+        .await
+        .unwrap();
+
+    // Give it a moment to start and persist WorkflowStarted.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Prune with 0-day retention — only terminal runs are eligible.
+    engine.prune_now().await;
+
+    assert_eq!(
+        engine.get_run_status(run_id).await.unwrap(),
+        RunStatus::Running,
+        "running workflow must never be pruned"
+    );
+
+    engine.cancel_workflow(run_id).await.unwrap();
+    wait_for_status(&engine, run_id, RunStatus::Cancelled).await;
+    handle.shutdown().await;
 }

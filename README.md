@@ -556,6 +556,44 @@ for run in &completed {
 
 `RunFilter` supports: `status`, `workflow_name`, `created_after`, `created_before`, `limit`, `offset`.
 
+### Run retention
+
+Terminal workflow runs (completed, failed, cancelled) accumulate in the database indefinitely by default. Configure a retention policy to delete them automatically. Running workflows are never pruned.
+
+**Global retention** — delete all terminal runs older than N days:
+
+```rust
+let mut engine = WorkflowEngine::builder()
+    .with_storage(storage)
+    .register_workflow(MyWorkflow)
+    .retention_days(30)   // delete terminal runs older than 30 days
+    .build()
+    .await?;
+```
+
+**Per-workflow retention** — override the global for a specific workflow type by implementing `Workflow::retention()`:
+
+```rust
+impl Workflow for ShortLivedWorkflow {
+    fn name(&self) -> &'static str { "short_lived" }
+    fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture { /* ... */ }
+
+    fn retention(&self) -> Option<Duration> {
+        Some(Duration::from_secs(7 * 24 * 3600))  // 7 days, even if global is 30
+    }
+}
+```
+
+**Priority rules:**
+- Per-workflow `retention()` returning `Some(d)` — always wins over global.
+- Per-workflow `retention()` returning `None` (the default) — falls back to global `retention_days`.
+- Both unset — runs are kept forever.
+
+**Pruning behaviour:**
+- A background Tokio task runs every hour and deletes expired terminal runs (with their full event logs).
+- The pruning task is started only when at least one retention period is configured; if no retention is set, no background task is spawned.
+- The task shuts down cleanly via `EngineHandle::shutdown()`.
+
 ## Determinism rules
 
 The workflow function will be executed **more than once**: on crash recovery, the engine re-runs it from the top, fast-forwarding through history. Each call to `execute_activity` or `sleep` is matched to history by its call position (a `sequence_id` counter that starts at 0 and increments with each call). If the function's call sequence differs between runs, the engine reads the wrong history entries and replay produces incorrect results.
@@ -872,6 +910,7 @@ The demo runs a `GreetingWorkflow` that executes an activity, sleeps 2 seconds, 
 | `port` | `3000` | `GEARS_PORT` |
 | `swagger_ui` | `true` | `GEARS_SWAGGER_UI` |
 | `max_concurrent_workflows` | `50` | `GEARS_MAX_CONCURRENT_WORKFLOWS` |
+| `retention_days` | (unset — keep forever) | `GEARS_RETENTION_DAYS` |
 
 `log_level` accepts any [`tracing-subscriber` env-filter directive](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) (e.g. `trace`, `gears=debug,info`, `gears=warn`).
 

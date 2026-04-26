@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -29,6 +30,31 @@ pub struct ActivityInfo {
     pub timeout_ms: Option<u64>,
 }
 
+/// Controls automatic deletion of terminal workflow runs.
+///
+/// Configure on the engine builder with [`WorkflowEngineBuilder::retention_days`].
+/// Per-workflow overrides are set via [`Workflow::retention`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RetentionPolicy {
+    /// Delete terminal runs of any workflow type older than this many days.
+    /// `None` means keep forever (the default).
+    pub global_days: Option<u32>,
+}
+
+impl RetentionPolicy {
+    /// Compute the effective retention for a specific workflow type.
+    ///
+    /// - `Some(d)` from per-workflow `Workflow::retention()` always wins.
+    /// - `None` from per-workflow falls back to `global_days`.
+    /// - Both `None` → no pruning.
+    pub fn effective_for(&self, wf_retention: Option<Duration>) -> Option<Duration> {
+        match wf_retention {
+            Some(d) => Some(d),
+            None => self.global_days.map(|d| Duration::from_secs(d as u64 * 86_400)),
+        }
+    }
+}
+
 // ── Internal message types ────────────────────────────────────────────────
 
 struct StartRequest {
@@ -48,6 +74,7 @@ pub struct WorkflowEngineBuilder {
     activities: HashMap<String, Arc<dyn Activity>>,
     max_concurrent: usize,
     cleanup_policy: CleanupPolicy,
+    retention_policy: RetentionPolicy,
 }
 
 impl Default for WorkflowEngineBuilder {
@@ -58,6 +85,7 @@ impl Default for WorkflowEngineBuilder {
             activities: HashMap::new(),
             max_concurrent: 100,
             cleanup_policy: CleanupPolicy::default(),
+            retention_policy: RetentionPolicy::default(),
         }
     }
 }
@@ -97,6 +125,14 @@ impl WorkflowEngineBuilder {
         self
     }
 
+    /// Delete terminal runs (completed / failed / cancelled) older than `days`
+    /// days. Individual workflows may override this via [`Workflow::retention`].
+    /// If neither this nor a per-workflow retention is set, runs are kept forever.
+    pub fn retention_days(mut self, days: u32) -> Self {
+        self.retention_policy.global_days = Some(days);
+        self
+    }
+
     pub async fn build(self) -> Result<WorkflowEngine> {
         let storage = self
             .storage
@@ -120,6 +156,7 @@ impl WorkflowEngineBuilder {
             job_scheduler,
             job_handles: Arc::new(Mutex::new(HashMap::new())),
             cleanup_policy: self.cleanup_policy,
+            retention_policy: self.retention_policy,
         })
     }
 }
@@ -139,6 +176,7 @@ pub struct WorkflowEngine {
     /// Maps schedule name → scheduler job UUID (for pause/remove).
     job_handles: Arc<Mutex<HashMap<String, Uuid>>>,
     cleanup_policy: CleanupPolicy,
+    retention_policy: RetentionPolicy,
 }
 
 impl WorkflowEngine {
@@ -224,8 +262,25 @@ impl WorkflowEngine {
             .await
             .map_err(|e| GearsError::Other(format!("scheduler start failed: {e}")))?;
 
+        let pruner_shutdown_tx = if self.retention_policy.global_days.is_some()
+            || self.workflows.values().any(|w| w.retention().is_some())
+        {
+            let (pruner_tx, pruner_rx) = oneshot::channel::<()>();
+            tokio::spawn(pruning_loop(
+                pruner_rx,
+                self.storage.clone(),
+                self.workflows.clone(),
+                self.retention_policy,
+            ));
+            tracing::info!("retention pruning task started");
+            Some(pruner_tx)
+        } else {
+            None
+        };
+
         Ok(EngineHandle {
             shutdown_tx,
+            pruner_shutdown_tx,
             job_scheduler: self.job_scheduler.clone(),
         })
     }
@@ -469,6 +524,12 @@ impl WorkflowEngine {
         tracing::info!(schedule = name, "schedule resumed");
         Ok(())
     }
+
+    /// Trigger a pruning pass immediately. Intended for testing.
+    #[doc(hidden)]
+    pub async fn prune_now(&self) {
+        run_pruning_pass(&self.storage, &self.workflows, &self.retention_policy).await;
+    }
 }
 
 // ── Dispatch loop ─────────────────────────────────────────────────────────
@@ -593,12 +654,123 @@ fn build_scheduler_job(
 /// stop the dispatch loop and the cron scheduler.
 pub struct EngineHandle {
     shutdown_tx: oneshot::Sender<()>,
+    pruner_shutdown_tx: Option<oneshot::Sender<()>>,
     job_scheduler: Arc<Mutex<JobScheduler>>,
 }
 
 impl EngineHandle {
     pub async fn shutdown(self) {
         let _ = self.job_scheduler.lock().await.shutdown().await;
+        if let Some(tx) = self.pruner_shutdown_tx {
+            let _ = tx.send(());
+        }
         let _ = self.shutdown_tx.send(());
+    }
+}
+
+// ── Retention pruning ─────────────────────────────────────────────────────
+
+async fn pruning_loop(
+    mut shutdown_rx: oneshot::Receiver<()>,
+    storage: Arc<dyn Storage>,
+    workflows: Arc<HashMap<String, Arc<dyn Workflow>>>,
+    policy: RetentionPolicy,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(3_600));
+    interval.tick().await; // consume the immediate first tick
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                run_pruning_pass(&storage, &workflows, &policy).await;
+            }
+            _ = &mut shutdown_rx => {
+                tracing::info!("retention pruning task shutting down");
+                break;
+            }
+        }
+    }
+}
+
+async fn run_pruning_pass(
+    storage: &Arc<dyn Storage>,
+    workflows: &Arc<HashMap<String, Arc<dyn Workflow>>>,
+    policy: &RetentionPolicy,
+) {
+    let now = Utc::now();
+
+    // Phase A: prune each registered workflow by its effective retention.
+    for (name, wf) in workflows.iter() {
+        let Some(duration) = policy.effective_for(wf.retention()) else {
+            continue;
+        };
+        let cutoff = now
+            - chrono::Duration::from_std(duration)
+                .unwrap_or(chrono::Duration::try_days(i64::MAX / 86_400).unwrap_or_default());
+        prune_terminal_runs(storage, Some(name.as_str()), cutoff).await;
+    }
+
+    // Phase B: apply global retention to orphaned workflow types (no longer registered).
+    if let Some(days) = policy.global_days {
+        let cutoff = now - chrono::Duration::days(days as i64);
+        let registered: HashSet<&str> = workflows.keys().map(String::as_str).collect();
+        for status in [RunStatus::Completed, RunStatus::Failed, RunStatus::Cancelled] {
+            let filter = RunFilter {
+                status: Some(status),
+                created_before: Some(cutoff),
+                limit: Some(1000),
+                ..Default::default()
+            };
+            match storage.list_runs(&filter).await {
+                Ok(runs) => {
+                    for run in runs
+                        .into_iter()
+                        .filter(|r| !registered.contains(r.workflow_name.as_str()))
+                    {
+                        delete_run_logged(storage, run.run_id, &run.workflow_name).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "pruning: list_runs failed for orphaned workflows");
+                }
+            }
+        }
+    }
+}
+
+async fn prune_terminal_runs(
+    storage: &Arc<dyn Storage>,
+    workflow_name: Option<&str>,
+    cutoff: DateTime<Utc>,
+) {
+    for status in [RunStatus::Completed, RunStatus::Failed, RunStatus::Cancelled] {
+        let filter = RunFilter {
+            status: Some(status),
+            workflow_name: workflow_name.map(String::from),
+            created_before: Some(cutoff),
+            limit: Some(1000),
+            ..Default::default()
+        };
+        match storage.list_runs(&filter).await {
+            Ok(runs) => {
+                for run in runs {
+                    delete_run_logged(storage, run.run_id, &run.workflow_name).await;
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    workflow = ?workflow_name,
+                    error = %e,
+                    "pruning: list_runs failed"
+                );
+            }
+        }
+    }
+}
+
+async fn delete_run_logged(storage: &Arc<dyn Storage>, run_id: Uuid, workflow_name: &str) {
+    match storage.delete_run(run_id).await {
+        Ok(()) => tracing::info!(%run_id, workflow = workflow_name, "pruned expired workflow run"),
+        Err(e) => tracing::error!(%run_id, error = %e, "pruning: failed to delete run"),
     }
 }

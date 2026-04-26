@@ -6,9 +6,11 @@
 #   GEARS_LOG_LEVEL=info
 #   GEARS_DATABASE_URL=/var/lib/gears/demo.db
 #   GEARS_MAX_CONCURRENT_WORKFLOWS=100
+#   GEARS_RETENTION_DAYS=30
 
 log_level = "gears=debug,info"
 database_url = "gears-demo.db"
 port = 3000
 swagger_ui = true
 max_concurrent_workflows = 50
+# retention_days = 30  # delete terminal runs older than N days (omit to keep forever)

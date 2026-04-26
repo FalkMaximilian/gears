@@ -51,6 +51,9 @@ struct Config {
     swagger_ui: bool,
     /// Maximum number of concurrently executing workflows
     max_concurrent_workflows: usize,
+    /// Delete terminal runs (completed/failed/cancelled) older than N days.
+    /// Unset means keep runs forever.
+    retention_days: Option<u32>,
 }
 
 impl Config {
@@ -410,7 +413,7 @@ async fn main() -> anyhow::Result<()> {
 
     let storage = SqliteStorage::open(&cfg.database_url).await?;
 
-    let mut engine = WorkflowEngine::builder()
+    let mut builder = WorkflowEngine::builder()
         .with_storage(storage)
         .register_workflow(GreetingWorkflow)
         .register_workflow(HeartbeatWorkflow)
@@ -421,9 +424,13 @@ async fn main() -> anyhow::Result<()> {
         .register_activity(ReleaseResourceActivity)
         .register_activity(ConfirmOrderActivity)
         .register_activity(NotifyCustomerActivity)
-        .max_concurrent_workflows(cfg.max_concurrent_workflows)
-        .build()
-        .await?;
+        .max_concurrent_workflows(cfg.max_concurrent_workflows);
+
+    if let Some(days) = cfg.retention_days {
+        builder = builder.retention_days(days);
+    }
+
+    let mut engine = builder.build().await?;
 
     let engine_handle = engine.run().await?;
 

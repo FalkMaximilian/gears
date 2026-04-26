@@ -589,6 +589,29 @@ impl Storage for SqliteStorage {
             Ok(())
         })
     }
+
+    fn delete_run(&self, run_id: Uuid) -> StorageFuture<()> {
+        let conn = self.conn.clone();
+        let id = run_id.to_string();
+
+        Box::pin(async move {
+            conn.call(move |conn| {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "DELETE FROM workflow_events WHERE run_id = ?1",
+                    rusqlite::params![id],
+                )?;
+                tx.execute(
+                    "DELETE FROM workflow_runs WHERE run_id = ?1",
+                    rusqlite::params![id],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+            Ok(())
+        })
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -629,6 +652,26 @@ fn parse_schedule_row(
         created_at,
         last_fired_at,
     })
+}
+
+impl SqliteStorage {
+    /// Overwrite `created_at` / `updated_at` to simulate aged runs.
+    /// Intended for testing only; not part of the stable API.
+    #[doc(hidden)]
+    pub async fn backdate_run(&self, run_id: Uuid, days_ago: i64) {
+        let conn = self.conn.clone();
+        let id = run_id.to_string();
+        let ts = (Utc::now() - chrono::Duration::days(days_ago)).timestamp_millis();
+        conn.call(move |c| -> rusqlite::Result<()> {
+            c.execute(
+                "UPDATE workflow_runs SET created_at = ?1, updated_at = ?1 WHERE run_id = ?2",
+                rusqlite::params![ts, id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
 }
 
 #[cfg(test)]
