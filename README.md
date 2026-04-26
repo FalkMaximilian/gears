@@ -318,17 +318,17 @@ Each branch is allocated a contiguous block of `BRANCH_BUDGET` (1000) sequence I
 
 ### Versioning
 
-`ctx.get_version()` enables safe workflow code changes while runs are in-flight. On a fresh execution, `max_version` is stored and returned. On replay, the previously stored version is returned. This lets you branch on code versions without breaking in-progress runs.
+`ctx.get_version()` and `ctx.changed()` enable safe workflow code changes while runs are in-flight. On a fresh execution, the current version is stored. On replay, the previously stored version is returned, so in-progress runs can follow the code path that was current when they started.
+
+For the common binary "before/after" case, use `ctx.changed()`:
 
 ```rust
 fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture {
     Box::pin(async move {
-        let version = ctx.get_version("add_notification", 1, 2).await?;
-
         let result = ctx.execute_activity("process_order", input).await?;
 
-        if version >= 2 {
-            // New code path — only runs for new executions.
+        if ctx.changed("add_notification").await? {
+            // Only runs for workflows started after this change was introduced.
             ctx.execute_activity("send_notification", result.clone()).await?;
         }
 
@@ -337,7 +337,19 @@ fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture {
 }
 ```
 
-Unlike `execute_activity` and `sleep`, version markers are keyed by `change_id` (not by sequence position), so inserting a `get_version` call does not shift other calls' sequence IDs.
+For multi-step migrations where you need a numeric version, use `ctx.get_version(change_id, max_version)`:
+
+```rust
+let version = ctx.get_version("revamped_pipeline", 3).await?;
+// version is 1, 2, or 3 depending on when this run was started
+if version >= 3 {
+    ctx.execute_activity("new_step", input.clone()).await?;
+} else if version >= 2 {
+    ctx.execute_activity("middle_step", input.clone()).await?;
+}
+```
+
+Unlike `execute_activity` and `sleep`, version markers are keyed by `change_id` (not by sequence position), so inserting a version check does not shift other calls' sequence IDs.
 
 ### Workflow cancellation
 
@@ -1064,7 +1076,7 @@ Emitted metrics:
 | `ActivityTimedOut { activity_name, timeout }` | An activity attempt exceeded its configured `timeout()`. Each timed-out attempt counts as a failure and may be retried. | Increase `timeout()`, reduce work per attempt, or handle in the workflow. |
 | `ActivityNotFound(name)` | `ctx.execute_activity("name", ...)` called but no activity with that name is registered. | Fix the name string or register the activity. |
 | `WorkflowNotFound(name)` | `engine.start_workflow("name", ...)` called with an unregistered name. | Fix the name string or register the workflow. |
-| `VersionConflict { change_id, stored, min, max }` | The stored version marker for `change_id` is outside `[min, max]`. The running code is too far ahead of or behind the persisted version. | Widen the `[min, max]` range in `get_version()` to include `stored`. |
+| `VersionConflict { change_id, stored, max }` | The stored version marker for `change_id` exceeds `max_version`. The running code is older than what was persisted — likely a rollback. | Bump `max_version` in `get_version()` to at least `stored`, or re-deploy the newer code. |
 | `TaskPanicked(msg)` | A Tokio task spawned by `execute_activities_parallel` or `concurrently` panicked. | Investigate the panic in the task. Prefer `?` over `unwrap` in activity code. |
 | `BranchBudgetExceeded { budget }` | A concurrent branch performed more than `BRANCH_BUDGET` (1000) total operations. | Reduce branch complexity, or call `concurrently` from the root workflow context rather than nesting it inside another branch. |
 | `RunNotFound(run_id)` | `engine.cancel_workflow(run_id)` called but no active context exists for that ID (run already completed or was never started). | Check the run status before cancelling. |
@@ -1191,7 +1203,7 @@ The dispatch loop holds a `Semaphore` to bound concurrent workflow executions. E
 - **Parallel activities** — `ctx.execute_activities_parallel()` for concurrent fan-out of individual activities with deterministic replay
 - **Concurrent branches** — `ctx.concurrently()` / `ctx.try_concurrently()` / `ctx.concurrently_2/3/4()` for running entire multi-step workflow sequences in parallel; each branch has its own `WorkflowContext` with a pre-allocated sequence-ID range; crash-safe and fully replayable; `branch()` helper for ergonomic closure boxing
 - **Durable timers** — `ctx.sleep(duration)` and `ctx.sleep_until(datetime)` survive process crashes
-- **Versioning** — `ctx.get_version(change_id, min, max)` for safe workflow code changes with in-flight runs
+- **Versioning** — `ctx.changed(change_id)` / `ctx.get_version(change_id, max)` for safe workflow code changes with in-flight runs
 - **Crash recovery** — in-flight workflows detected and resumed on engine startup
 - **Workflow cancellation** — `engine.cancel_workflow(run_id)` cooperatively stops a running workflow
 - **Cleanup / Finalizers** — `ctx.register_cleanup(activity_name, input)` schedules cleanup activities; configurable policy: `OnSuccessOrCancelled` (default) or `Always` (also runs on failure); LIFO order; failures tolerated and recorded; crash-safe via `CleanupCompleted`/`CleanupFailed` events

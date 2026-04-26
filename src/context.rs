@@ -882,20 +882,18 @@ impl WorkflowContext {
     /// workflow code changes while runs are in-flight.
     ///
     /// On a fresh execution, `max_version` is stored and returned. On
-    /// replay, the previously stored version is returned. If the stored
-    /// version falls outside `[min_version, max_version]`, an error is
-    /// returned (the code has drifted too far from the persisted history).
+    /// replay, the previously stored version is returned (which may be lower
+    /// than `max_version` if this run predates later code changes). An error
+    /// is returned only if the stored version *exceeds* `max_version`, which
+    /// indicates a rollback — the running code is older than what was persisted.
     ///
     /// Unlike `execute_activity` and `sleep`, this does **not** consume a
     /// sequence_id — the marker is keyed by `change_id` instead, so
     /// inserting a version check does not shift other calls.
-    pub async fn get_version(
-        &self,
-        change_id: &str,
-        min_version: u32,
-        max_version: u32,
-    ) -> Result<u32> {
-        // Replay: look for an existing marker.
+    ///
+    /// For the common binary case ("did this change happen?") prefer
+    /// [`changed`](Self::changed).
+    pub async fn get_version(&self, change_id: &str, max_version: u32) -> Result<u32> {
         for event in &self.inner.history {
             if let EventPayload::VersionMarker {
                 change_id: cid,
@@ -903,11 +901,10 @@ impl WorkflowContext {
             } = &event.payload
                 && cid == change_id
             {
-                if *version < min_version || *version > max_version {
+                if *version > max_version {
                     return Err(GearsError::VersionConflict {
                         change_id: change_id.to_string(),
                         stored: *version,
-                        min: min_version,
                         max: max_version,
                     });
                 }
@@ -922,6 +919,17 @@ impl WorkflowContext {
         })
         .await?;
         Ok(max_version)
+    }
+
+    /// Returns `true` if this workflow run was started after the code change
+    /// identified by `change_id` was introduced.
+    ///
+    /// This is ergonomic sugar for `get_version(change_id, 1).await? >= 1`,
+    /// covering the common case where you only need a binary "before/after"
+    /// guard rather than a numeric version. For multi-step migrations use
+    /// [`get_version`](Self::get_version) directly.
+    pub async fn changed(&self, change_id: &str) -> Result<bool> {
+        Ok(self.get_version(change_id, 1).await? >= 1)
     }
 
     // ── cleanup ───────────────────────────────────────────────────────────

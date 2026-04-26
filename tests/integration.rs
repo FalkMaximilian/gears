@@ -278,7 +278,7 @@ impl Workflow for VersionedWorkflow {
 
     fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
         Box::pin(async move {
-            let version = ctx.get_version("add_step_2", 1, 2).await?;
+            let version = ctx.get_version("add_step_2", 2).await?;
             if version >= 2 {
                 let _ = ctx
                     .execute_activity(EchoActivity::NAME, json!({"step": 2}))
@@ -288,6 +288,34 @@ impl Workflow for VersionedWorkflow {
                 .execute_activity(EchoActivity::NAME, json!({"step": 1}))
                 .await?;
             Ok(json!({"version": version, "result": result}))
+        })
+    }
+}
+
+struct ChangedWorkflow;
+
+impl ChangedWorkflow {
+    pub const NAME: &'static str = "changed_workflow";
+}
+
+impl Workflow for ChangedWorkflow {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn run(&self, ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            let mut steps = vec!["step_1"];
+            if ctx.changed("add_step_2").await? {
+                steps.push("step_2");
+                let _ = ctx
+                    .execute_activity(EchoActivity::NAME, json!({"step": 2}))
+                    .await?;
+            }
+            let result = ctx
+                .execute_activity(EchoActivity::NAME, json!({"step": 1}))
+                .await?;
+            Ok(json!({"steps": steps, "result": result}))
         })
     }
 }
@@ -307,6 +335,7 @@ async fn build_engine() -> WorkflowEngine {
         .register_workflow(TryParallelWorkflow)
         .register_workflow(HeterogeneousWorkflow)
         .register_workflow(VersionedWorkflow)
+        .register_workflow(ChangedWorkflow)
         .register_activity(EchoActivity)
         .register_activity(FailActivity)
         .register_activity(SlowActivity)
@@ -423,6 +452,24 @@ async fn test_versioning() {
     let run_id = engine.start_workflow("versioned", json!({})).await.unwrap();
 
     wait_for_status(&engine, run_id, RunStatus::Completed).await;
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_changed() {
+    let mut engine = build_engine().await;
+    let handle = engine.run().await.unwrap();
+
+    let run_id = engine
+        .start_workflow("changed_workflow", json!({}))
+        .await
+        .unwrap();
+
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+
+    let result = engine.get_run_result(run_id).await.unwrap().unwrap();
+    assert_eq!(result["steps"], json!(["step_1", "step_2"]));
+
     handle.shutdown().await;
 }
 

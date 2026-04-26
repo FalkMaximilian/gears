@@ -36,12 +36,12 @@ pub enum GearsError {
         timeout: Duration,
     },
 
-    /// The stored version marker for `change_id` is outside `[min, max]`.
-    #[error("version incompatibility for '{change_id}': stored={stored} range=[{min}, {max}]")]
+    /// The stored version marker for `change_id` exceeds the current `max_version`.
+    /// This indicates a rollback — the running code is older than what was persisted.
+    #[error("version incompatibility for '{change_id}': stored={stored} exceeds max={max}")]
     VersionConflict {
         change_id: String,
         stored: u32,
-        min: u32,
         max: u32,
     },
 
