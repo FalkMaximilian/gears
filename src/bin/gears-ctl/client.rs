@@ -32,6 +32,12 @@ pub struct ActivityInfo {
     pub timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowInfo {
+    pub name: String,
+    pub retention_secs: Option<u64>,
+}
+
 /// A single event in a run's history, processed for display.
 #[derive(Debug, Clone)]
 pub struct WorkflowEventRow {
@@ -248,7 +254,7 @@ impl ApiClient {
         Ok(())
     }
 
-    pub async fn list_workflows(&self) -> anyhow::Result<Vec<String>> {
+    pub async fn list_workflows(&self) -> anyhow::Result<Vec<WorkflowInfo>> {
         let url = format!("{}/api/workflows", self.base_url);
         Ok(self.client.get(&url).send().await?.json().await?)
     }
@@ -256,5 +262,11 @@ impl ApiClient {
     pub async fn list_activities(&self) -> anyhow::Result<Vec<ActivityInfo>> {
         let url = format!("{}/api/activities", self.base_url);
         Ok(self.client.get(&url).send().await?.json().await?)
+    }
+
+    pub async fn trigger_prune(&self) -> anyhow::Result<()> {
+        let url = format!("{}/api/runs/prune", self.base_url);
+        self.client.post(&url).send().await?;
+        Ok(())
     }
 }

@@ -156,6 +156,10 @@ async fn run(
                         KeyCode::Char('y') if app.tab == Tab::Runs && !app.detail_mode => {
                             app.copy_run_id().await;
                         }
+                        KeyCode::Char('P') if app.tab == Tab::Runs => {
+                            app.prune_now().await;
+                            app.refresh().await;
+                        }
 
                         // Schedules tab actions
                         KeyCode::Char('p') if app.tab == Tab::Schedules => {

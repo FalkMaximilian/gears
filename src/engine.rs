@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
@@ -28,6 +28,14 @@ pub struct ActivityInfo {
     pub max_attempts: u32,
     pub retry_base_delay_ms: u64,
     pub timeout_ms: Option<u64>,
+}
+
+/// Metadata about a registered workflow, returned by [`WorkflowEngine::workflow_info_list`].
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct WorkflowInfo {
+    pub name: String,
+    /// Effective retention in seconds. `None` means runs are kept forever.
+    pub retention_secs: Option<u64>,
 }
 
 /// Controls automatic deletion of terminal workflow runs.
@@ -457,6 +465,21 @@ impl WorkflowEngine {
                 max_attempts: a.max_attempts(),
                 retry_base_delay_ms: a.retry_base_delay().as_millis() as u64,
                 timeout_ms: a.timeout().map(|d| d.as_millis() as u64),
+            })
+            .collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        list
+    }
+
+    /// Metadata for all registered workflows (name, effective retention).
+    pub fn workflow_info_list(&self) -> Vec<WorkflowInfo> {
+        let mut list: Vec<WorkflowInfo> = self
+            .workflows
+            .values()
+            .map(|wf| {
+                let effective = self.retention_policy.effective_for(wf.retention());
+                let retention_secs = effective.map(|d| d.as_secs());
+                WorkflowInfo { name: wf.name().to_string(), retention_secs }
             })
             .collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));

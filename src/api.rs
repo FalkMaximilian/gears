@@ -14,7 +14,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::{
     GearsError, WorkflowEngine,
-    engine::ActivityInfo,
+    engine::{ActivityInfo, WorkflowInfo},
     event::{EventPayload, WorkflowEvent},
     traits::{RunFilter, RunStatus, ScheduleRecord, ScheduleStatus},
 };
@@ -268,6 +268,19 @@ async fn cancel_run(
 }
 
 #[utoipa::path(
+    post,
+    path = "/runs/prune",
+    responses(
+        (status = 204, description = "Pruning pass triggered"),
+    ),
+    tag = "runs"
+)]
+async fn prune_runs_handler(State(engine): State<Arc<WorkflowEngine>>) -> impl IntoResponse {
+    engine.prune_now().await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[utoipa::path(
     get,
     path = "/runs/{id}/events",
     params(
@@ -426,12 +439,12 @@ async fn resume_schedule_handler(
     get,
     path = "/workflows",
     responses(
-        (status = 200, description = "Names of all registered workflows", body = Vec<String>),
+        (status = 200, description = "Metadata for all registered workflows", body = Vec<WorkflowInfo>),
     ),
     tag = "registered"
 )]
 async fn list_workflows_handler(State(engine): State<Arc<WorkflowEngine>>) -> impl IntoResponse {
-    Json(engine.workflow_names()).into_response()
+    Json(engine.workflow_info_list()).into_response()
 }
 
 #[utoipa::path(
@@ -456,6 +469,7 @@ async fn list_activities_handler(State(engine): State<Arc<WorkflowEngine>>) -> i
         start_run_handler,
         get_run,
         cancel_run,
+        prune_runs_handler,
         get_run_events_handler,
         list_schedules_handler,
         create_schedule_handler,
@@ -473,6 +487,7 @@ async fn list_activities_handler(State(engine): State<Arc<WorkflowEngine>>) -> i
         CreateScheduleRequest,
         ScheduleResponse,
         ActivityInfo,
+        WorkflowInfo,
         WorkflowEvent,
         EventPayload,
     )),
@@ -517,6 +532,7 @@ pub fn management_router() -> Router<Arc<WorkflowEngine>> {
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/events", get(get_run_events_handler))
         .route("/runs/{id}/cancel", post(cancel_run))
+        .route("/runs/prune", post(prune_runs_handler))
         .route(
             "/schedules",
             get(list_schedules_handler).post(create_schedule_handler),

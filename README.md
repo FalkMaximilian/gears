@@ -776,12 +776,13 @@ let app = Router::new()
 | `GET` | `/api/runs/{id}` | Run detail including result JSON |
 | `GET` | `/api/runs/{id}/events` | Full ordered event log for a run as a JSON array |
 | `POST` | `/api/runs/{id}/cancel` | Cancel a running workflow |
+| `POST` | `/api/runs/prune` | Trigger an immediate pruning pass (deletes expired terminal runs) |
 | `GET` | `/api/schedules` | List all cron schedules |
 | `POST` | `/api/schedules` | Create or update a schedule |
 | `DELETE` | `/api/schedules/{name}` | Delete a schedule |
 | `POST` | `/api/schedules/{name}/pause` | Pause a schedule |
 | `POST` | `/api/schedules/{name}/resume` | Resume a paused schedule |
-| `GET` | `/api/workflows` | List registered workflow names |
+| `GET` | `/api/workflows` | List registered workflows as `WorkflowInfo` objects (name, effective retention_secs) |
 | `GET` | `/api/activities` | List registered activities as `ActivityInfo` objects (name, max_attempts, retry_base_delay_ms, timeout_ms) |
 | `GET` | `/api/openapi.json` | OpenAPI 3.1 spec for the management API |
 

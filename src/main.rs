@@ -236,6 +236,10 @@ impl Workflow for HeartbeatWorkflow {
         Self::NAME
     }
 
+    fn retention(&self) -> Option<Duration> {
+        Some(Duration::from_secs(2 * 3600))
+    }
+
     fn run(&self, _ctx: WorkflowContext, _input: Value) -> WorkflowFuture {
         Box::pin(async move {
             println!("[heartbeat] tick at {}", chrono::Utc::now());

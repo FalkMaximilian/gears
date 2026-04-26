@@ -2,7 +2,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Tabs, Wrap},
 };
 
@@ -124,7 +124,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
         let selected = app
             .workflows_list
             .get(app.registered_cursor)
-            .map(|s| s.as_str())
+            .map(|wf| wf.name.as_str())
             .unwrap_or("?");
         Span::styled(
             format!(
@@ -163,7 +163,7 @@ fn build_hints(app: &App) -> &'static str {
         " ↑↓ Scroll  Esc Back  r Refresh  q Quit"
     } else {
         match app.tab {
-            Tab::Runs => " ↑↓ Navigate  Enter Detail  c Cancel  / Filter  f Status  y Copy ID  r Refresh  Tab Switch  q Quit",
+            Tab::Runs => " ↑↓ Navigate  Enter Detail  c Cancel  / Filter  f Status  y Copy ID  P Prune  r Refresh  Tab Switch  q Quit",
             Tab::Schedules => " ↑↓ Navigate  p Pause/Resume  d Delete  r Refresh  Tab Switch  q Quit",
             Tab::Registered => " ↑↓ Navigate  n Run  r Refresh  Tab Switch  q Quit",
         }
@@ -250,24 +250,32 @@ fn render_runs(app: &App, frame: &mut Frame, area: Rect) {
 pub fn render_run_detail(app: &App, frame: &mut Frame, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .constraints([Constraint::Length(4), Constraint::Min(0)])
         .split(area);
 
     // Info block at top.
     let run = app.runs.get(app.run_cursor);
-    let info = if let Some(r) = run {
+    let info_text: Text = if let Some(r) = run {
         let dur = format_duration(&r.created_at, &r.updated_at, &r.status);
-        format!(
+        let line1 = format!(
             " {} │ {} │ {} │ {} ",
             r.workflow_name,
             r.run_id,
             r.status.to_uppercase(),
             dur
-        )
+        );
+        let retention_line = format_retention_info(r.status.as_str(), &r.created_at, r.workflow_name.as_str(), &app.workflows_list);
+        Text::from(vec![
+            Line::from(line1),
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(retention_line, Style::default().fg(Color::DarkGray)),
+            ]),
+        ])
     } else {
-        String::new()
+        Text::default()
     };
-    let info_para = Paragraph::new(info)
+    let info_para = Paragraph::new(info_text)
         .block(Block::default().borders(Borders::ALL).title(" Run Detail "))
         .style(Style::default().fg(Color::White));
     frame.render_widget(info_para, chunks[0]);
@@ -371,11 +379,22 @@ fn render_registered(app: &App, frame: &mut Frame, area: Rect) {
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(area);
 
-    // Left: workflow list.
+    // Left: workflow list with retention label.
     let items: Vec<ListItem> = app
         .workflows_list
         .iter()
-        .map(|name| ListItem::new(name.as_str()))
+        .map(|wf| {
+            let ret = match wf.retention_secs {
+                Some(s) => format!("({})", format_retention_duration(s)),
+                None => "(∞)".to_string(),
+            };
+            let line = Line::from(vec![
+                Span::raw(wf.name.as_str()),
+                Span::raw("  "),
+                Span::styled(ret, Style::default().fg(Color::DarkGray)),
+            ]);
+            ListItem::new(line)
+        })
         .collect();
 
     let mut list_state = ListState::default();
@@ -500,6 +519,71 @@ fn format_duration(created_at: &str, updated_at: &str, status: &str) -> String {
         format!("{}m{:02}s", secs / 60, secs % 60)
     } else {
         format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+fn format_retention_info(
+    status: &str,
+    created_at: &str,
+    workflow_name: &str,
+    workflows: &[crate::client::WorkflowInfo],
+) -> String {
+    if status == "running" {
+        return String::new();
+    }
+    let retention_secs = workflows
+        .iter()
+        .find(|wf| wf.name == workflow_name)
+        .and_then(|wf| wf.retention_secs);
+
+    match retention_secs {
+        None => "Kept forever (no retention policy)".to_string(),
+        Some(secs) => {
+            let parse = |s: &str| -> Option<chrono::DateTime<chrono::Utc>> {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .ok()
+                    .map(|t| t.with_timezone(&chrono::Utc))
+            };
+            if let Some(created) = parse(created_at) {
+                let retention = chrono::Duration::seconds(secs as i64);
+                let removal = created + retention;
+                let now = chrono::Utc::now();
+                let remaining = (removal - now).num_seconds().max(0) as u64;
+                let time_left = if remaining < 3600 {
+                    format!("{}m", remaining / 60)
+                } else if remaining < 86_400 {
+                    format!("{}h{}m", remaining / 3600, (remaining % 3600) / 60)
+                } else {
+                    format!("{}d{}h", remaining / 86_400, (remaining % 86_400) / 3600)
+                };
+                if removal > now {
+                    format!(
+                        "Removes: {} UTC  (in {})",
+                        removal.format("%Y-%m-%d %H:%M"),
+                        time_left
+                    )
+                } else {
+                    format!(
+                        "Removing soon (next pruning pass)  [was due {}]",
+                        removal.format("%Y-%m-%d %H:%M UTC")
+                    )
+                }
+            } else {
+                String::new()
+            }
+        }
+    }
+}
+
+fn format_retention_duration(secs: u64) -> String {
+    if secs % 86_400 == 0 {
+        format!("{}d", secs / 86_400)
+    } else if secs % 3_600 == 0 {
+        format!("{}h", secs / 3_600)
+    } else if secs % 60 == 0 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}s", secs)
     }
 }
 

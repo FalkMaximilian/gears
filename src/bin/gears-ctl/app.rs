@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::client::{ActivityInfo, ApiClient, RunSummary, ScheduleInfo, WorkflowEventRow};
+use crate::client::{ActivityInfo, ApiClient, RunSummary, ScheduleInfo, WorkflowEventRow, WorkflowInfo};
 
 // ── Tab ───────────────────────────────────────────────────────────────────
 
@@ -35,7 +35,7 @@ pub struct App {
     pub schedule_cursor: usize,
 
     // Registered tab
-    pub workflows_list: Vec<String>,
+    pub workflows_list: Vec<WorkflowInfo>,
     pub activities_list: Vec<ActivityInfo>,
     pub registered_cursor: usize,
 
@@ -252,7 +252,11 @@ impl App {
     }
 
     pub async fn submit_run(&mut self) {
-        let Some(workflow_name) = self.workflows_list.get(self.registered_cursor).cloned() else {
+        let Some(workflow_name) = self
+            .workflows_list
+            .get(self.registered_cursor)
+            .map(|wf| wf.name.clone())
+        else {
             self.status_msg = "No workflow selected.".to_string();
             self.stop_input();
             return;
@@ -311,6 +315,15 @@ impl App {
         #[cfg(not(target_os = "macos"))]
         {
             self.status_msg = "Clipboard not supported on this platform.".to_string();
+        }
+    }
+
+    // ── Prune (P) ─────────────────────────────────────────────────────────
+
+    pub async fn prune_now(&mut self) {
+        match self.client.trigger_prune().await {
+            Ok(()) => self.status_msg = "Pruning pass triggered.".to_string(),
+            Err(e) => self.show_error(format!("Prune failed: {e}")),
         }
     }
 

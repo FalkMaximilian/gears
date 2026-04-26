@@ -12,7 +12,7 @@ pub mod worker;
 // Public re-exports for library users.
 pub use api::{management_router, openapi_spec};
 pub use context::{ActivityContext, BranchFn, BranchFuture, WorkflowContext, branch, BRANCH_BUDGET};
-pub use engine::{ActivityInfo, EngineHandle, RetentionPolicy, WorkflowEngine, WorkflowEngineBuilder};
+pub use engine::{ActivityInfo, EngineHandle, RetentionPolicy, WorkflowEngine, WorkflowEngineBuilder, WorkflowInfo};
 pub use worker::CleanupPolicy;
 pub use error::{Result, GearsError};
 pub use event::{EventPayload, WorkflowEvent};
