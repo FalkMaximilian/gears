@@ -5,8 +5,9 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{get, post},
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -14,7 +15,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::{
     GearsError, WorkflowEngine,
-    engine::{ActivityInfo, WorkflowInfo},
+    engine::{ActivityInfo, EngineInfo, WorkflowInfo},
     event::{EventPayload, WorkflowEvent},
     traits::{RunFilter, RunStatus, ScheduleRecord, ScheduleStatus},
 };
@@ -39,6 +40,25 @@ pub struct RunDetail {
     pub updated_at: String,
     #[schema(value_type = Object)]
     pub result: Option<Value>,
+    /// Error message when status is `"failed"`. `null` for all other statuses.
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct RunStats {
+    pub total: usize,
+    pub running: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct PatchScheduleRequest {
+    pub cron_expression: Option<String>,
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub input: Option<Value>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -82,6 +102,16 @@ pub struct RunListQuery {
     pub workflow_name: Option<String>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+    /// ISO 8601 datetime — only return runs created at or after this time.
+    pub created_after: Option<String>,
+    /// ISO 8601 datetime — only return runs created at or before this time.
+    pub created_before: Option<String>,
+}
+
+#[derive(Deserialize, Default, IntoParams)]
+pub struct ScheduleListQuery {
+    /// Filter by workflow name (exact match).
+    pub workflow_name: Option<String>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -121,6 +151,20 @@ fn to_schedule_response(r: ScheduleRecord) -> ScheduleResponse {
     }
 }
 
+fn parse_datetime(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.with_timezone(&Utc))
+}
+
+fn extract_run_error(events: &[WorkflowEvent]) -> Option<String> {
+    events.iter().rev().find_map(|e| {
+        if let EventPayload::WorkflowFailed { error } = &e.payload {
+            Some(error.clone())
+        } else {
+            None
+        }
+    })
+}
+
 fn engine_err(e: GearsError) -> (StatusCode, String) {
     match e {
         GearsError::RunNotFound(_) | GearsError::ScheduleNotFound(_) => {
@@ -154,6 +198,8 @@ async fn list_runs(
         workflow_name: q.workflow_name,
         limit: q.limit,
         offset: q.offset,
+        created_after: q.created_after.as_deref().and_then(parse_datetime),
+        created_before: q.created_before.as_deref().and_then(parse_datetime),
         ..Default::default()
     };
     match engine.list_runs(&filter).await {
@@ -219,22 +265,29 @@ async fn get_run(
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
     let filter = RunFilter::default();
-    let (list_res, result_res) =
-        tokio::join!(engine.list_runs(&filter), engine.get_run_result(id),);
-    match (list_res, result_res) {
-        (Ok(runs), Ok(result)) => match runs.into_iter().find(|r| r.run_id == id) {
-            Some(run) => Json(RunDetail {
-                run_id: run.run_id,
-                workflow_name: run.workflow_name,
-                status: status_str(&run.status).to_string(),
-                created_at: run.created_at.to_rfc3339(),
-                updated_at: run.updated_at.to_rfc3339(),
-                result,
-            })
-            .into_response(),
+    let (list_res, result_res, events_res) = tokio::join!(
+        engine.list_runs(&filter),
+        engine.get_run_result(id),
+        engine.get_run_events(id),
+    );
+    match (list_res, result_res, events_res) {
+        (Ok(runs), Ok(result), Ok(events)) => match runs.into_iter().find(|r| r.run_id == id) {
+            Some(run) => {
+                let error = extract_run_error(&events);
+                Json(RunDetail {
+                    run_id: run.run_id,
+                    workflow_name: run.workflow_name,
+                    status: status_str(&run.status).to_string(),
+                    created_at: run.created_at.to_rfc3339(),
+                    updated_at: run.updated_at.to_rfc3339(),
+                    result,
+                    error,
+                })
+                .into_response()
+            }
             None => (StatusCode::NOT_FOUND, "run not found".to_string()).into_response(),
         },
-        (Err(e), _) | (_, Err(e)) => {
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
             let (code, msg) = engine_err(e);
             (code, msg).into_response()
         }
@@ -309,6 +362,7 @@ async fn get_run_events_handler(
 #[utoipa::path(
     get,
     path = "/schedules",
+    params(ScheduleListQuery),
     responses(
         (status = 200, description = "List of schedules", body = Vec<ScheduleResponse>),
         (status = 500, description = "Internal server error"),
@@ -317,11 +371,20 @@ async fn get_run_events_handler(
 )]
 async fn list_schedules_handler(
     State(engine): State<Arc<WorkflowEngine>>,
+    Query(q): Query<ScheduleListQuery>,
 ) -> impl IntoResponse {
     match engine.list_schedules().await {
         Ok(schedules) => {
-            Json(schedules.into_iter().map(to_schedule_response).collect::<Vec<_>>())
-                .into_response()
+            let filtered: Vec<_> = schedules
+                .into_iter()
+                .filter(|s| {
+                    q.workflow_name
+                        .as_deref()
+                        .map_or(true, |wn| s.workflow_name == wn)
+                })
+                .map(to_schedule_response)
+                .collect();
+            Json(filtered).into_response()
         }
         Err(e) => {
             let (code, msg) = engine_err(e);
@@ -437,6 +500,158 @@ async fn resume_schedule_handler(
 
 #[utoipa::path(
     get,
+    path = "/schedules/{name}",
+    params(
+        ("name" = String, Path, description = "Schedule name"),
+    ),
+    responses(
+        (status = 200, description = "Schedule detail", body = ScheduleResponse),
+        (status = 404, description = "Schedule not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "schedules"
+)]
+async fn get_schedule_handler(
+    State(engine): State<Arc<WorkflowEngine>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match engine.get_schedule(&name).await {
+        Ok(record) => Json(to_schedule_response(record)).into_response(),
+        Err(e) => {
+            let (code, msg) = engine_err(e);
+            (code, msg).into_response()
+        }
+    }
+}
+
+#[utoipa::path(
+    patch,
+    path = "/schedules/{name}",
+    params(
+        ("name" = String, Path, description = "Schedule name"),
+    ),
+    request_body = PatchScheduleRequest,
+    responses(
+        (status = 200, description = "Schedule updated", body = ScheduleResponse),
+        (status = 404, description = "Schedule not found"),
+        (status = 422, description = "Invalid cron expression"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "schedules"
+)]
+async fn patch_schedule_handler(
+    State(engine): State<Arc<WorkflowEngine>>,
+    Path(name): Path<String>,
+    Json(req): Json<PatchScheduleRequest>,
+) -> impl IntoResponse {
+    let existing = match engine.get_schedule(&name).await {
+        Ok(r) => r,
+        Err(e) => {
+            let (code, msg) = engine_err(e);
+            return (code, msg).into_response();
+        }
+    };
+    let new_cron = req
+        .cron_expression
+        .as_deref()
+        .unwrap_or(&existing.cron_expression);
+    let new_input = req.input.unwrap_or(existing.input);
+    match engine
+        .schedule_workflow(&name, new_cron, &existing.workflow_name, new_input)
+        .await
+    {
+        Ok(()) => match engine.get_schedule(&name).await {
+            Ok(record) => Json(to_schedule_response(record)).into_response(),
+            Err(e) => {
+                let (code, msg) = engine_err(e);
+                (code, msg).into_response()
+            }
+        },
+        Err(e) => {
+            let (code, msg) = engine_err(e);
+            (code, msg).into_response()
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/schedules/{name}/trigger",
+    params(
+        ("name" = String, Path, description = "Schedule name"),
+    ),
+    responses(
+        (status = 201, description = "Run started", body = StartRunResponse),
+        (status = 404, description = "Schedule not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "schedules"
+)]
+async fn trigger_schedule_handler(
+    State(engine): State<Arc<WorkflowEngine>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match engine.trigger_schedule(&name).await {
+        Ok(run_id) => (StatusCode::CREATED, Json(StartRunResponse { run_id })).into_response(),
+        Err(e) => {
+            let (code, msg) = engine_err(e);
+            (code, msg).into_response()
+        }
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/runs/stats",
+    responses(
+        (status = 200, description = "Aggregate run counts by status", body = RunStats),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "runs"
+)]
+async fn run_stats_handler(State(engine): State<Arc<WorkflowEngine>>) -> impl IntoResponse {
+    let filter = RunFilter::default();
+    match engine.list_runs(&filter).await {
+        Ok(runs) => {
+            let mut stats = RunStats {
+                total: runs.len(),
+                running: 0,
+                completed: 0,
+                failed: 0,
+                cancelled: 0,
+            };
+            for run in &runs {
+                match run.status {
+                    RunStatus::Running => stats.running += 1,
+                    RunStatus::Completed => stats.completed += 1,
+                    RunStatus::Failed => stats.failed += 1,
+                    RunStatus::Cancelled => stats.cancelled += 1,
+                    RunStatus::NotFound => {}
+                }
+            }
+            Json(stats).into_response()
+        }
+        Err(e) => {
+            let (code, msg) = engine_err(e);
+            (code, msg).into_response()
+        }
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/engine/info",
+    responses(
+        (status = 200, description = "Engine runtime configuration snapshot", body = EngineInfo),
+    ),
+    tag = "engine"
+)]
+async fn engine_info_handler(State(engine): State<Arc<WorkflowEngine>>) -> impl IntoResponse {
+    Json(engine.engine_info()).into_response()
+}
+
+#[utoipa::path(
+    get,
     path = "/workflows",
     responses(
         (status = 200, description = "Metadata for all registered workflows", body = Vec<WorkflowInfo>),
@@ -470,24 +685,32 @@ async fn list_activities_handler(State(engine): State<Arc<WorkflowEngine>>) -> i
         get_run,
         cancel_run,
         prune_runs_handler,
+        run_stats_handler,
         get_run_events_handler,
         list_schedules_handler,
         create_schedule_handler,
+        get_schedule_handler,
+        patch_schedule_handler,
         delete_schedule_handler,
         pause_schedule_handler,
         resume_schedule_handler,
+        trigger_schedule_handler,
         list_workflows_handler,
         list_activities_handler,
+        engine_info_handler,
     ),
     components(schemas(
         RunSummary,
         RunDetail,
+        RunStats,
         StartRunRequest,
         StartRunResponse,
         CreateScheduleRequest,
+        PatchScheduleRequest,
         ScheduleResponse,
         ActivityInfo,
         WorkflowInfo,
+        EngineInfo,
         WorkflowEvent,
         EventPayload,
     )),
@@ -495,6 +718,7 @@ async fn list_activities_handler(State(engine): State<Arc<WorkflowEngine>>) -> i
         (name = "runs", description = "Workflow run management"),
         (name = "schedules", description = "Cron schedule management"),
         (name = "registered", description = "Registered workflows and activities"),
+        (name = "engine", description = "Engine health and configuration"),
     ),
     info(
         title = "Gears Workflow Engine API",
@@ -529,17 +753,25 @@ pub fn management_router() -> Router<Arc<WorkflowEngine>> {
     Router::new()
         .route("/openapi.json", get(openapi_json_handler))
         .route("/runs", get(list_runs).post(start_run_handler))
+        .route("/runs/stats", get(run_stats_handler))
+        .route("/runs/prune", post(prune_runs_handler))
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/events", get(get_run_events_handler))
         .route("/runs/{id}/cancel", post(cancel_run))
-        .route("/runs/prune", post(prune_runs_handler))
         .route(
             "/schedules",
             get(list_schedules_handler).post(create_schedule_handler),
         )
-        .route("/schedules/{name}", delete(delete_schedule_handler))
+        .route(
+            "/schedules/{name}",
+            get(get_schedule_handler)
+                .patch(patch_schedule_handler)
+                .delete(delete_schedule_handler),
+        )
+        .route("/schedules/{name}/trigger", post(trigger_schedule_handler))
         .route("/schedules/{name}/pause", post(pause_schedule_handler))
         .route("/schedules/{name}/resume", post(resume_schedule_handler))
         .route("/workflows", get(list_workflows_handler))
         .route("/activities", get(list_activities_handler))
+        .route("/engine/info", get(engine_info_handler))
 }

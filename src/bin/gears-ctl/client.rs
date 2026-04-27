@@ -38,6 +38,14 @@ pub struct WorkflowInfo {
     pub retention_secs: Option<u64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct EngineInfo {
+    pub max_concurrent_workflows: usize,
+    pub global_retention_days: Option<u32>,
+    pub registered_workflows: usize,
+    pub registered_activities: usize,
+}
+
 /// A single event in a run's history, processed for display.
 #[derive(Debug, Clone)]
 pub struct WorkflowEventRow {
@@ -268,5 +276,19 @@ impl ApiClient {
         let url = format!("{}/api/runs/prune", self.base_url);
         self.client.post(&url).send().await?;
         Ok(())
+    }
+
+    pub async fn trigger_schedule(&self, name: &str) -> anyhow::Result<Uuid> {
+        let url = format!("{}/api/schedules/{}/trigger", self.base_url, name);
+        let resp: serde_json::Value = self.client.post(&url).send().await?.json().await?;
+        let id = resp["run_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing run_id in response"))?;
+        Ok(id.parse()?)
+    }
+
+    pub async fn get_engine_info(&self) -> anyhow::Result<EngineInfo> {
+        let url = format!("{}/api/engine/info", self.base_url);
+        Ok(self.client.get(&url).send().await?.json().await?)
     }
 }

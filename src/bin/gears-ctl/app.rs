@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::client::{ActivityInfo, ApiClient, RunSummary, ScheduleInfo, WorkflowEventRow, WorkflowInfo};
+use crate::client::{ActivityInfo, ApiClient, EngineInfo, RunSummary, ScheduleInfo, WorkflowEventRow, WorkflowInfo};
 
 // ── Tab ───────────────────────────────────────────────────────────────────
 
@@ -56,6 +56,13 @@ pub struct App {
     pub input_mode: bool,
     pub input_buffer: String,
 
+    // Schedule filter (/ key on Schedules tab)
+    pub schedule_filter_active: bool,
+    pub schedule_filter_input: String,
+
+    // Engine info (fetched on refresh)
+    pub engine_info: Option<EngineInfo>,
+
     // Misc UI state
     pub status_msg: String,
     pub connected: bool,
@@ -87,6 +94,9 @@ impl App {
             filter_active: false,
             filter_input: String::new(),
             status_filter: None,
+            schedule_filter_active: false,
+            schedule_filter_input: String::new(),
+            engine_info: None,
             input_mode: false,
             input_buffer: String::new(),
             status_msg: "Connecting…".to_string(),
@@ -102,25 +112,29 @@ impl App {
     // ── Refresh ───────────────────────────────────────────────────────────
 
     pub async fn refresh(&mut self) {
-        let (runs_res, schedules_res, workflows_res, activities_res) = tokio::join!(
-            self.client.list_runs(self.status_filter),
-            self.client.list_schedules(),
-            self.client.list_workflows(),
-            self.client.list_activities(),
-        );
+        let (runs_res, schedules_res, workflows_res, activities_res, engine_info_res) =
+            tokio::join!(
+                self.client.list_runs(self.status_filter),
+                self.client.list_schedules(),
+                self.client.list_workflows(),
+                self.client.list_activities(),
+                self.client.get_engine_info(),
+            );
 
         match (runs_res, schedules_res, workflows_res, activities_res) {
             (Ok(runs), Ok(schedules), Ok(workflows), Ok(activities)) => {
                 self.connected = true;
                 self.run_cursor = self.run_cursor.min(runs.len().saturating_sub(1));
-                self.schedule_cursor =
-                    self.schedule_cursor.min(schedules.len().saturating_sub(1));
+                self.schedule_cursor = self
+                    .schedule_cursor
+                    .min(self.filtered_schedules_of(&schedules).len().saturating_sub(1));
                 self.registered_cursor =
                     self.registered_cursor.min(workflows.len().saturating_sub(1));
                 self.runs = runs;
                 self.schedules = schedules;
                 self.workflows_list = workflows;
                 self.activities_list = activities;
+                self.engine_info = engine_info_res.ok();
                 self.status_msg = String::new();
                 self.last_refreshed = Some(Instant::now());
             }
@@ -381,6 +395,55 @@ impl App {
         }
     }
 
+    pub async fn trigger_schedule_selected(&mut self) {
+        let filtered = self.filtered_schedules();
+        if let Some(schedule) = filtered.get(self.schedule_cursor) {
+            let name = schedule.name.clone();
+            match self.client.trigger_schedule(&name).await {
+                Ok(run_id) => {
+                    let short = run_id.to_string();
+                    self.status_msg = format!("Started run {}", &short[..8]);
+                    self.tab = Tab::Runs;
+                    self.refresh().await;
+                }
+                Err(e) => self.show_error(format!("Trigger failed: {e}")),
+            }
+        }
+    }
+
+    // ── Schedule filter (/) ───────────────────────────────────────────────
+
+    pub fn start_schedule_filter(&mut self) {
+        self.schedule_filter_active = true;
+    }
+
+    pub fn stop_schedule_filter(&mut self) {
+        self.schedule_filter_active = false;
+        self.schedule_filter_input.clear();
+    }
+
+    pub fn push_schedule_filter_char(&mut self, c: char) {
+        self.schedule_filter_input.push(c);
+        self.schedule_cursor = 0;
+    }
+
+    pub fn pop_schedule_filter_char(&mut self) {
+        self.schedule_filter_input.pop();
+        self.schedule_cursor = 0;
+    }
+
+    pub fn filtered_schedules(&self) -> Vec<&ScheduleInfo> {
+        self.filtered_schedules_of(&self.schedules)
+    }
+
+    fn filtered_schedules_of<'a>(&self, schedules: &'a [ScheduleInfo]) -> Vec<&'a ScheduleInfo> {
+        let needle = self.schedule_filter_input.to_lowercase();
+        schedules
+            .iter()
+            .filter(|s| s.name.to_lowercase().contains(&needle))
+            .collect()
+    }
+
     // ── Navigation ────────────────────────────────────────────────────────
 
     pub fn scroll_up(&mut self) {
@@ -393,7 +456,7 @@ impl App {
                 }
             }
             Tab::Schedules => {
-                if self.schedule_cursor > 0 {
+                if !self.schedule_filter_active && self.schedule_cursor > 0 {
                     self.schedule_cursor -= 1;
                 }
             }
@@ -418,9 +481,11 @@ impl App {
                 }
             }
             Tab::Schedules => {
-                let max = self.schedules.len().saturating_sub(1);
-                if self.schedule_cursor < max {
-                    self.schedule_cursor += 1;
+                if !self.schedule_filter_active {
+                    let max = self.filtered_schedules().len().saturating_sub(1);
+                    if self.schedule_cursor < max {
+                        self.schedule_cursor += 1;
+                    }
                 }
             }
             Tab::Registered => {

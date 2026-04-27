@@ -99,6 +99,16 @@ async fn run(
                         continue;
                     }
 
+                    if app.schedule_filter_active {
+                        match key.code {
+                            KeyCode::Esc => app.stop_schedule_filter(),
+                            KeyCode::Backspace => app.pop_schedule_filter_char(),
+                            KeyCode::Char(c) => app.push_schedule_filter_char(c),
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     if app.input_mode {
                         match key.code {
                             KeyCode::Esc => app.stop_input(),
@@ -162,11 +172,17 @@ async fn run(
                         }
 
                         // Schedules tab actions
+                        KeyCode::Char('t') if app.tab == Tab::Schedules => {
+                            app.trigger_schedule_selected().await;
+                        }
                         KeyCode::Char('p') if app.tab == Tab::Schedules => {
                             app.pause_resume_selected().await;
                         }
                         KeyCode::Char('d') if app.tab == Tab::Schedules => {
                             app.delete_selected_schedule().await;
+                        }
+                        KeyCode::Char('/') if app.tab == Tab::Schedules => {
+                            app.start_schedule_filter();
                         }
 
                         // Registered tab actions

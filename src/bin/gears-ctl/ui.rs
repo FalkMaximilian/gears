@@ -141,6 +141,14 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
             ),
             Style::default().fg(Color::Cyan),
         )
+    } else if app.schedule_filter_active {
+        Span::styled(
+            format!(
+                " Schedule filter: {}▌   [Esc] Done  [Backspace] Delete",
+                app.schedule_filter_input
+            ),
+            Style::default().fg(Color::Cyan),
+        )
     } else {
         let hints = build_hints(app);
         if app.status_msg.is_empty() {
@@ -164,7 +172,7 @@ fn build_hints(app: &App) -> &'static str {
     } else {
         match app.tab {
             Tab::Runs => " ↑↓ Navigate  Enter Detail  c Cancel  / Filter  f Status  y Copy ID  P Prune  r Refresh  Tab Switch  q Quit",
-            Tab::Schedules => " ↑↓ Navigate  p Pause/Resume  d Delete  r Refresh  Tab Switch  q Quit",
+            Tab::Schedules => " ↑↓ Navigate  t Trigger  p Pause/Resume  d Delete  / Filter  r Refresh  Tab Switch  q Quit",
             Tab::Registered => " ↑↓ Navigate  n Run  r Refresh  Tab Switch  q Quit",
         }
     }
@@ -228,10 +236,29 @@ fn render_runs(app: &App, frame: &mut Frame, area: Rect) {
     }
 
     let title = if app.connected {
+        let running = app.runs.iter().filter(|r| r.status == "running").count();
+        let completed = app.runs.iter().filter(|r| r.status == "completed").count();
+        let failed = app.runs.iter().filter(|r| r.status == "failed").count();
+        let cancelled = app.runs.iter().filter(|r| r.status == "cancelled").count();
         if filtered.len() != app.runs.len() {
-            format!(" Runs ({}/{}) ", filtered.len(), app.runs.len())
+            format!(
+                " Runs ({}/{}) ● {} ✓ {} ✗ {} ⊘ {} ",
+                filtered.len(),
+                app.runs.len(),
+                running,
+                completed,
+                failed,
+                cancelled
+            )
         } else {
-            format!(" Runs ({}) ", app.runs.len())
+            format!(
+                " Runs ({}) ● {} ✓ {} ✗ {} ⊘ {} ",
+                app.runs.len(),
+                running,
+                completed,
+                failed,
+                cancelled
+            )
         }
     } else {
         " Runs (disconnected) ".to_string()
@@ -324,13 +351,14 @@ pub fn render_run_detail(app: &App, frame: &mut Frame, area: Rect) {
 // ── Schedules ─────────────────────────────────────────────────────────────
 
 fn render_schedules(app: &App, frame: &mut Frame, area: Rect) {
+    let filtered = app.filtered_schedules();
+
     let header_cells = ["Name", "Cron", "Workflow", "Status", "Last Fired"]
         .iter()
         .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1);
 
-    let rows: Vec<Row> = app
-        .schedules
+    let rows: Vec<Row> = filtered
         .iter()
         .map(|s| {
             let status_style = match s.status.as_str() {
@@ -358,11 +386,15 @@ fn render_schedules(app: &App, frame: &mut Frame, area: Rect) {
     ];
 
     let mut state = TableState::default();
-    if !app.schedules.is_empty() {
+    if !filtered.is_empty() {
         state.select(Some(app.schedule_cursor));
     }
 
-    let title = format!(" Schedules ({}) ", app.schedules.len());
+    let title = if filtered.len() != app.schedules.len() {
+        format!(" Schedules ({}/{}) ", filtered.len(), app.schedules.len())
+    } else {
+        format!(" Schedules ({}) ", app.schedules.len())
+    };
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -374,10 +406,37 @@ fn render_schedules(app: &App, frame: &mut Frame, area: Rect) {
 // ── Registered (workflows + activities) ──────────────────────────────────
 
 fn render_registered(app: &App, frame: &mut Frame, area: Rect) {
+    let engine_panel_height = if app.engine_info.is_some() { 3 } else { 0 };
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(engine_panel_height),
+        ])
+        .split(area);
+
+    if let Some(info) = &app.engine_info {
+        let retention = match info.global_retention_days {
+            Some(d) => format!("{d}d"),
+            None => "forever".to_string(),
+        };
+        let text = format!(
+            " max concurrent: {}   global retention: {}   workflows: {}   activities: {}",
+            info.max_concurrent_workflows,
+            retention,
+            info.registered_workflows,
+            info.registered_activities,
+        );
+        let para = Paragraph::new(text)
+            .block(Block::default().borders(Borders::ALL).title(" Engine "))
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(para, sections[1]);
+    }
+
     let halves = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(area);
+        .split(sections[0]);
 
     // Left: workflow list with retention label.
     let items: Vec<ListItem> = app

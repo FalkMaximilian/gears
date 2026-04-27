@@ -38,6 +38,19 @@ pub struct WorkflowInfo {
     pub retention_secs: Option<u64>,
 }
 
+/// Runtime configuration snapshot returned by [`WorkflowEngine::engine_info`].
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct EngineInfo {
+    /// Maximum number of concurrently executing workflow runs.
+    pub max_concurrent_workflows: usize,
+    /// Global retention in days. `None` means runs are kept forever (unless overridden per workflow).
+    pub global_retention_days: Option<u32>,
+    /// Number of registered workflow types.
+    pub registered_workflows: usize,
+    /// Number of registered activity types.
+    pub registered_activities: usize,
+}
+
 /// Controls automatic deletion of terminal workflow runs.
 ///
 /// Configure on the engine builder with [`WorkflowEngineBuilder::retention_days`].
@@ -546,6 +559,39 @@ impl WorkflowEngine {
             .await?;
         tracing::info!(schedule = name, "schedule resumed");
         Ok(())
+    }
+
+    /// Returns a snapshot of the engine's current runtime configuration.
+    pub fn engine_info(&self) -> EngineInfo {
+        EngineInfo {
+            max_concurrent_workflows: self.max_concurrent,
+            global_retention_days: self.retention_policy.global_days,
+            registered_workflows: self.workflows.len(),
+            registered_activities: self.activities.len(),
+        }
+    }
+
+    /// Fetch a single schedule by name.
+    /// Returns `GearsError::ScheduleNotFound` if it does not exist.
+    pub async fn get_schedule(&self, name: &str) -> Result<ScheduleRecord> {
+        self.storage
+            .get_schedule(name)
+            .await?
+            .ok_or_else(|| GearsError::ScheduleNotFound(name.to_string()))
+    }
+
+    /// Fire a schedule immediately without waiting for its next cron tick.
+    /// Starts a workflow run with the schedule's configured workflow name and input.
+    /// Returns the new run ID. Does not update `last_fired_at`. Works on paused schedules.
+    pub async fn trigger_schedule(&self, name: &str) -> Result<Uuid> {
+        let record = self
+            .storage
+            .get_schedule(name)
+            .await?
+            .ok_or_else(|| GearsError::ScheduleNotFound(name.to_string()))?;
+        let run_id = self.start_workflow(&record.workflow_name, record.input).await?;
+        tracing::info!(schedule = name, %run_id, "schedule triggered manually");
+        Ok(run_id)
     }
 
     /// Trigger a pruning pass immediately. Intended for testing.
