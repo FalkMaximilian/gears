@@ -6,10 +6,11 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::context::{ActivityContext, WorkflowContext};
+use crate::engine::{ExternalActivityConfig, ExternalTaskQueue};
 use crate::error::GearsError;
 use crate::event::EventPayload;
 use crate::metrics;
-use crate::traits::{Activity, RunStatus, Storage, Workflow};
+use crate::traits::{Activity, RunStatus, Storage, TaskResult, Workflow};
 
 /// Controls when registered cleanups are executed after a workflow run ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -178,10 +179,14 @@ pub(crate) struct WorkerTask {
     pub run_id: Uuid,
     pub workflow: Arc<dyn Workflow>,
     pub activities: Arc<HashMap<String, Arc<dyn Activity>>>,
+    pub external_activity_configs: Arc<HashMap<String, ExternalActivityConfig>>,
     pub storage: Arc<dyn Storage>,
     pub history: Vec<crate::event::WorkflowEvent>,
     pub input: Value,
     pub cleanup_policy: CleanupPolicy,
+    pub task_queue: Arc<ExternalTaskQueue>,
+    pub pending_completions:
+        Arc<tokio::sync::Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<TaskResult>>>>,
 }
 
 impl WorkerTask {
@@ -218,6 +223,9 @@ impl WorkerTask {
             self.history,
             self.storage.clone(),
             self.activities.clone(),
+            self.external_activity_configs.clone(),
+            self.task_queue.clone(),
+            self.pending_completions.clone(),
         );
 
         // Register cancel handle so the engine can cancel this workflow.

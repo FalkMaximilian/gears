@@ -17,7 +17,7 @@ use crate::{
     GearsError, WorkflowEngine,
     engine::{ActivityInfo, EngineInfo, WorkflowInfo},
     event::{EventPayload, WorkflowEvent},
-    traits::{RunFilter, RunStatus, ScheduleRecord, ScheduleStatus},
+    traits::{PendingTask, RunFilter, RunStatus, ScheduleRecord, ScheduleStatus},
 };
 
 // ── Response types ────────────────────────────────────────────────────────
@@ -167,11 +167,14 @@ fn extract_run_error(events: &[WorkflowEvent]) -> Option<String> {
 
 fn engine_err(e: GearsError) -> (StatusCode, String) {
     match e {
-        GearsError::RunNotFound(_) | GearsError::ScheduleNotFound(_) => {
-            (StatusCode::NOT_FOUND, e.to_string())
-        }
+        GearsError::RunNotFound(_)
+        | GearsError::ScheduleNotFound(_)
+        | GearsError::TaskNotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
         GearsError::WorkflowNotFound(_) | GearsError::InvalidSchedule(_) => {
             (StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+        }
+        GearsError::TaskAlreadyResolved(_) | GearsError::HeartbeatMismatch(_) => {
+            (StatusCode::CONFLICT, e.to_string())
         }
         _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -675,6 +678,184 @@ async fn list_activities_handler(State(engine): State<Arc<WorkflowEngine>>) -> i
     Json(info).into_response()
 }
 
+// ── Worker endpoints ──────────────────────────────────────────────────────
+
+#[derive(Deserialize, ToSchema)]
+pub struct PollTaskRequest {
+    pub worker_id: String,
+    pub activity_names: Vec<String>,
+    /// How long to wait (ms) if no task is immediately available. Default: 30 000.
+    pub long_poll_timeout_ms: Option<u64>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct TaskAssignment {
+    pub task_token: Uuid,
+    pub run_id: Uuid,
+    pub activity_name: String,
+    #[schema(value_type = Object)]
+    pub input: Value,
+    pub attempt: u32,
+    pub sequence_id: u32,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct CompleteTaskRequest {
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub output: Value,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct FailTaskRequest {
+    pub error: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct HeartbeatResponse {
+    /// `true` if the workflow run has been cancelled — the worker should stop.
+    pub run_cancelled: bool,
+}
+
+fn to_task_assignment(t: PendingTask) -> TaskAssignment {
+    TaskAssignment {
+        task_token: t.task_token,
+        run_id: t.run_id,
+        activity_name: t.activity_name,
+        input: t.input,
+        attempt: t.attempt,
+        sequence_id: t.sequence_id,
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/workers/poll",
+    request_body = PollTaskRequest,
+    responses(
+        (status = 200, description = "Task assigned", body = TaskAssignment),
+        (status = 204, description = "No task available within the long-poll window"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "workers"
+)]
+async fn poll_task_handler(
+    State(engine): State<Arc<WorkflowEngine>>,
+    Json(req): Json<PollTaskRequest>,
+) -> impl IntoResponse {
+    let timeout_ms = req.long_poll_timeout_ms.unwrap_or(30_000);
+    match engine
+        .poll_task(req.activity_names, req.worker_id, timeout_ms)
+        .await
+    {
+        Ok(Some(task)) => (StatusCode::OK, Json(to_task_assignment(task))).into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            let (code, msg) = engine_err(e);
+            (code, msg).into_response()
+        }
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/workers/tasks/{task_token}",
+    params(("task_token" = Uuid, Path, description = "Task token")),
+    responses(
+        (status = 200, description = "Task detail", body = PendingTask),
+        (status = 404, description = "Task not found"),
+    ),
+    tag = "workers"
+)]
+async fn get_task_handler(
+    State(engine): State<Arc<WorkflowEngine>>,
+    Path(task_token): Path<Uuid>,
+) -> impl IntoResponse {
+    match engine.get_pending_task(task_token).await {
+        Ok(task) => Json(task).into_response(),
+        Err(e) => {
+            let (code, msg) = engine_err(e);
+            (code, msg).into_response()
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/workers/tasks/{task_token}/complete",
+    params(("task_token" = Uuid, Path, description = "Task token")),
+    request_body = CompleteTaskRequest,
+    responses(
+        (status = 200, description = "Task marked completed"),
+        (status = 404, description = "Task not found"),
+        (status = 409, description = "Task already resolved"),
+    ),
+    tag = "workers"
+)]
+async fn complete_task_handler(
+    State(engine): State<Arc<WorkflowEngine>>,
+    Path(task_token): Path<Uuid>,
+    Json(req): Json<CompleteTaskRequest>,
+) -> impl IntoResponse {
+    match engine.complete_task(task_token, req.output).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => {
+            let (code, msg) = engine_err(e);
+            (code, msg).into_response()
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/workers/tasks/{task_token}/fail",
+    params(("task_token" = Uuid, Path, description = "Task token")),
+    request_body = FailTaskRequest,
+    responses(
+        (status = 200, description = "Task marked failed"),
+        (status = 404, description = "Task not found"),
+        (status = 409, description = "Task already resolved"),
+    ),
+    tag = "workers"
+)]
+async fn fail_task_handler(
+    State(engine): State<Arc<WorkflowEngine>>,
+    Path(task_token): Path<Uuid>,
+    Json(req): Json<FailTaskRequest>,
+) -> impl IntoResponse {
+    match engine.fail_task(task_token, req.error).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => {
+            let (code, msg) = engine_err(e);
+            (code, msg).into_response()
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/workers/tasks/{task_token}/heartbeat",
+    params(("task_token" = Uuid, Path, description = "Task token")),
+    responses(
+        (status = 200, description = "Heartbeat accepted", body = HeartbeatResponse),
+        (status = 404, description = "Task not found"),
+        (status = 409, description = "Task not in claimed status"),
+    ),
+    tag = "workers"
+)]
+async fn heartbeat_task_handler(
+    State(engine): State<Arc<WorkflowEngine>>,
+    Path(task_token): Path<Uuid>,
+) -> impl IntoResponse {
+    match engine.heartbeat_task(task_token).await {
+        Ok(run_cancelled) => Json(HeartbeatResponse { run_cancelled }).into_response(),
+        Err(e) => {
+            let (code, msg) = engine_err(e);
+            (code, msg).into_response()
+        }
+    }
+}
+
 // ── OpenAPI spec ──────────────────────────────────────────────────────────
 
 #[derive(OpenApi)]
@@ -698,6 +879,11 @@ async fn list_activities_handler(State(engine): State<Arc<WorkflowEngine>>) -> i
         list_workflows_handler,
         list_activities_handler,
         engine_info_handler,
+        poll_task_handler,
+        get_task_handler,
+        complete_task_handler,
+        fail_task_handler,
+        heartbeat_task_handler,
     ),
     components(schemas(
         RunSummary,
@@ -713,12 +899,19 @@ async fn list_activities_handler(State(engine): State<Arc<WorkflowEngine>>) -> i
         EngineInfo,
         WorkflowEvent,
         EventPayload,
+        PendingTask,
+        PollTaskRequest,
+        TaskAssignment,
+        CompleteTaskRequest,
+        FailTaskRequest,
+        HeartbeatResponse,
     )),
     tags(
         (name = "runs", description = "Workflow run management"),
         (name = "schedules", description = "Cron schedule management"),
         (name = "registered", description = "Registered workflows and activities"),
         (name = "engine", description = "Engine health and configuration"),
+        (name = "workers", description = "External worker task queue"),
     ),
     info(
         title = "Gears Workflow Engine API",
@@ -774,4 +967,18 @@ pub fn management_router() -> Router<Arc<WorkflowEngine>> {
         .route("/workflows", get(list_workflows_handler))
         .route("/activities", get(list_activities_handler))
         .route("/engine/info", get(engine_info_handler))
+        .route("/workers/poll", post(poll_task_handler))
+        .route("/workers/tasks/{task_token}", get(get_task_handler))
+        .route(
+            "/workers/tasks/{task_token}/complete",
+            post(complete_task_handler),
+        )
+        .route(
+            "/workers/tasks/{task_token}/fail",
+            post(fail_task_handler),
+        )
+        .route(
+            "/workers/tasks/{task_token}/heartbeat",
+            post(heartbeat_task_handler),
+        )
 }

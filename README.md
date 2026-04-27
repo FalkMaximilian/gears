@@ -226,6 +226,89 @@ let result: Option<OrderOutput> = engine.get_run_result_typed(run_id).await?;
 let raw: Option<Value> = engine.get_run_result(run_id).await?;
 ```
 
+### External workers
+
+For long-running or compute-heavy activities, gears supports **external workers** — separate processes that poll the engine for tasks, execute them locally, and report results back over HTTP. Multiple workers can handle the same activity type; the engine guarantees each task is delivered to exactly one worker.
+
+**Engine-side registration** — declare which activities are external when building the engine:
+
+```rust
+let mut engine = WorkflowEngine::builder()
+    .with_storage(storage)
+    .register_workflow(MyWorkflow)
+    // "send-email" executes in an external process, not in-process
+    .register_external_activity(
+        "send-email",
+        ExternalActivityConfig {
+            heartbeat_timeout: Duration::from_secs(30),
+            max_attempts: 3,
+            ..Default::default()
+        },
+    )
+    .build()
+    .await?;
+```
+
+The workflow code is unchanged — it calls `ctx.execute_activity("send-email", input)` exactly as it would for a local activity. The engine routes it to the external path automatically.
+
+**Worker implementation** — use the built-in Rust SDK or implement the HTTP protocol in any language:
+
+```rust
+use gears::external_worker::{ExternalActivity, ExternalActivityContext, ExternalWorker};
+use std::pin::Pin;
+use std::future::Future;
+
+struct SendEmail;
+
+impl ExternalActivity for SendEmail {
+    fn name(&self) -> &'static str { "send-email" }
+
+    fn execute(
+        &self,
+        ctx: ExternalActivityContext,
+        input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'static>> {
+        Box::pin(async move {
+            // Periodically heartbeat so the engine knows we are alive.
+            if ctx.heartbeat().await.unwrap_or(false) {
+                return Err("run cancelled".into());
+            }
+            // ... do the work ...
+            Ok(json!({"sent": true}))
+        })
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    ExternalWorker::builder("http://localhost:3000/api", "worker-1")
+        .register_activity(SendEmail)
+        .heartbeat_interval(Duration::from_secs(10))
+        .build()
+        .run()  // loops forever: poll → execute → complete/fail
+        .await
+}
+```
+
+**Worker protocol** — five HTTP endpoints under `/api/workers/`:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/workers/poll` | Long-poll for a task. Body: `{worker_id, activity_names, long_poll_timeout_ms?}`. Returns 200 `TaskAssignment` or 204 on timeout. |
+| `GET` | `/workers/tasks/{token}` | Fetch task details (for idempotent re-delivery after a worker crash). |
+| `POST` | `/workers/tasks/{token}/complete` | Report success. Body: `{"output": ...}`. |
+| `POST` | `/workers/tasks/{token}/fail` | Report failure. Body: `{"error": "message"}`. Engine retries if attempts remain. |
+| `POST` | `/workers/tasks/{token}/heartbeat` | Keep-alive. Returns `{"run_cancelled": bool}` — stop if `true`. |
+
+`TaskAssignment` response fields: `task_token`, `run_id`, `activity_name`, `input`, `attempt`, `sequence_id`.
+
+**Key properties:**
+- **Competing consumers** — multiple workers polling the same activity type each get distinct tasks; the claim is atomic in SQLite (`BEGIN IMMEDIATE`).
+- **Heartbeat liveness** — tasks not heartbeated within `heartbeat_timeout` are automatically reset to `pending` and re-queued for another worker.
+- **Crash-safe** — `PendingTask` records survive engine restarts; claimed tasks are reset to `pending` on startup.
+- **Language-agnostic** — the protocol is plain HTTP + JSON; workers can be written in any language.
+- **Full retry semantics** — `max_attempts` and `retry_base_delay` on `ExternalActivityConfig` work identically to local activities.
+
 ### Activity timeouts
 
 Activities can define an optional `timeout()`. If an activity does not complete within the timeout duration, the attempt is treated as a failure and may be retried (up to `max_attempts`). Each timed-out attempt persists an `ActivityAttemptTimedOut` event.
@@ -702,7 +785,8 @@ Every state transition appends an immutable event. The full schema:
 | Event | When written |
 |---|---|
 | `WorkflowStarted` | Once, when a new run begins |
-| `ActivityScheduled` | Before each activity execution |
+| `ActivityScheduled` | Before each activity execution (local or external) |
+| `ActivityDispatched` | When an external worker claims the task (audit-only; does not affect replay) |
 | `ActivityCompleted` | Activity returned `Ok` |
 | `ActivityAttemptFailed` | One attempt failed; retries remain |
 | `ActivityAttemptTimedOut` | One attempt timed out; retries remain |
@@ -797,6 +881,11 @@ let app = Router::new()
 | `GET` | `/api/workflows` | List registered workflows as `WorkflowInfo` objects (name, effective retention_secs) |
 | `GET` | `/api/activities` | List registered activities as `ActivityInfo` objects (name, max_attempts, retry_base_delay_ms, timeout_ms) |
 | `GET` | `/api/openapi.json` | OpenAPI 3.1 spec for the management API |
+| `POST` | `/api/workers/poll` | Long-poll for a pending task (body: `{worker_id, activity_names, long_poll_timeout_ms?}`). Returns 200 `TaskAssignment` or 204. |
+| `GET` | `/api/workers/tasks/{token}` | Get task details |
+| `POST` | `/api/workers/tasks/{token}/complete` | Report task success (body: `{output: ...}`) |
+| `POST` | `/api/workers/tasks/{token}/fail` | Report task failure (body: `{error: "..."}`) |
+| `POST` | `/api/workers/tasks/{token}/heartbeat` | Send heartbeat; returns `{run_cancelled: bool}` |
 
 ```bash
 # Example: list the last 10 completed runs
@@ -1083,6 +1172,9 @@ Emitted metrics:
 | `ScheduleNotFound(name)` | `pause_schedule` or `resume_schedule` called for an unknown schedule name. | Verify the schedule name or call `list_schedules()` to enumerate registered schedules. |
 | `InvalidSchedule(msg)` | An invalid cron expression was passed to `schedule_workflow`. | Fix the cron expression. Format: `sec min hour dom month dow`. |
 | `Cancelled` | `engine.cancel_workflow(run_id)` was called and propagated to the context. | Returned from `execute_activity` or `sleep`; the `WorkerTask` writes `WorkflowCancelled`. |
+| `TaskNotFound(token)` | Worker sent a heartbeat/complete/fail for a token that does not exist in `pending_tasks`. | Check that the `task_token` matches what was returned by `/workers/poll`. |
+| `TaskAlreadyResolved(token)` | Worker called complete or fail on a task that is already in a terminal state. | Idempotent: safe to ignore the 409 response. |
+| `HeartbeatMismatch(token)` | Heartbeat sent for a task not in `claimed` status (may have been reset by the stale monitor). | Worker should stop processing this task; re-poll for a new one. |
 | `EngineNotRunning` | `start_workflow` or `cancel_workflow` called before `engine.run()` or after shutdown. | Ensure the engine is running before submitting work. |
 | `Storage(e)` | A SQLite operation failed (I/O error, constraint violation). | Check disk space and file permissions. |
 | `Serialize(e)` | JSON serialization or deserialization of an event payload failed. | Check that activity inputs/outputs are JSON-serializable. |
@@ -1136,8 +1228,19 @@ pub trait Storage: Send + Sync + 'static {
     fn delete_schedule(&self, name: &str) -> StorageFuture<()>;
     fn set_schedule_status(&self, name: &str, status: ScheduleStatus) -> StorageFuture<()>;
     fn record_schedule_fired(&self, name: &str, fired_at: DateTime<Utc>) -> StorageFuture<()>;
+    // External worker task queue
+    fn create_pending_task(&self, task: PendingTask) -> StorageFuture<()>;
+    fn claim_pending_task(&self, activity_names: &[String], worker_id: &str) -> StorageFuture<Option<PendingTask>>;
+    fn resolve_pending_task(&self, task_token: Uuid, result: TaskResult) -> StorageFuture<()>;
+    fn heartbeat_pending_task(&self, task_token: Uuid) -> StorageFuture<bool>;
+    fn get_pending_task(&self, task_token: Uuid) -> StorageFuture<Option<PendingTask>>;
+    fn list_pending_tasks_by_run(&self, run_id: Uuid) -> StorageFuture<Vec<PendingTask>>;
+    fn list_stale_pending_tasks(&self, older_than_ms: u64) -> StorageFuture<Vec<PendingTask>>;
+    fn reset_pending_task(&self, task_token: Uuid) -> StorageFuture<()>;
 }
 ```
+
+The 8 external-worker methods have default `unimplemented!()` bodies, so existing `Storage` implementations compile without changes until they opt in.
 
 ## Building and testing
 
@@ -1155,24 +1258,25 @@ Tests use an in-memory SQLite database (`SqliteStorage::open(":memory:")`), so n
 
 ```
 src/
-├── lib.rs              Public API surface and re-exports
-├── main.rs             Demo application (Axum HTTP server + management API)
-├── api.rs              management_router() — REST control plane
-├── traits.rs           Workflow, Activity, Storage trait definitions
-├── typed.rs            TypedWorkflow, TypedActivity traits and blanket impls
-├── event.rs            WorkflowEvent and EventPayload types
-├── context.rs          WorkflowContext (replay engine, shared state) and ActivityContext
-├── engine.rs           WorkflowEngineBuilder, WorkflowEngine, dispatch loop
-├── worker.rs           WorkerTask — executes one workflow run end-to-end
-├── metrics.rs          Optional metrics instrumentation (behind `metrics` feature)
+├── lib.rs                Public API surface and re-exports
+├── main.rs               Demo application (Axum HTTP server + management API)
+├── api.rs                management_router() — REST control plane (runs, schedules, workers)
+├── traits.rs             Workflow, Activity, Storage trait definitions; PendingTask, TaskResult
+├── typed.rs              TypedWorkflow, TypedActivity traits and blanket impls
+├── event.rs              WorkflowEvent and EventPayload types
+├── context.rs            WorkflowContext (replay engine, shared state) and ActivityContext
+├── engine.rs             WorkflowEngineBuilder, WorkflowEngine, ExternalActivityConfig, dispatch loop
+├── worker.rs             WorkerTask — executes one workflow run end-to-end
+├── external_worker.rs    Rust SDK for writing external workers (ExternalWorker, ExternalActivity)
+├── metrics.rs            Optional metrics instrumentation (behind `metrics` feature)
 ├── storage/
-│   └── sqlite.rs       SqliteStorage implementation (WAL mode, bundled SQLite)
+│   └── sqlite.rs         SqliteStorage implementation (WAL mode, bundled SQLite, pending_tasks table)
 └── bin/
     └── gears-ctl/
-        ├── main.rs     TUI entry point (event loop, terminal setup)
-        ├── app.rs      App state and actions
-        ├── client.rs   HTTP client for the management API
-        └── ui.rs       ratatui rendering
+        ├── main.rs       TUI entry point (event loop, terminal setup)
+        ├── app.rs        App state and actions
+        ├── client.rs     HTTP client for the management API
+        └── ui.rs         ratatui rendering
 ```
 
 ```mermaid
@@ -1221,6 +1325,7 @@ The dispatch loop holds a `Semaphore` to bound concurrent workflow executions. E
 - **Typed convenience methods** — `execute_activity_typed`, `start_workflow_typed`, `get_run_result_typed` for compile-time type safety without manual serde
 - **Metrics** — optional Prometheus-compatible counters/gauges/histograms via `metrics` crate (feature-gated)
 - **Management REST API** — `management_router()` provides a drop-in Axum router covering runs, schedules, registered workflows/activities; embed it in any Axum application with `.nest("/api", management_router())`
+- **External workers** — HTTP long-polling task queue protocol for activities that run in separate processes; `register_external_activity(name, ExternalActivityConfig)` on the builder; five `/api/workers/` endpoints for poll/complete/fail/heartbeat/get; Rust SDK (`ExternalWorker`, `ExternalActivity`) included; any language supported; competing consumers, heartbeat-based liveness, crash-safe `PendingTask` storage
 - **OpenAPI 3.1 spec** — generated at compile time via `utoipa`; served at `GET /api/openapi.json`; also available as `openapi_spec()` for programmatic use
 - **Swagger UI** — embedded interactive API browser at `/swagger-ui` in `gears-demo`; add to any Axum app via `utoipa-swagger-ui`
 - **gears-ctl TUI** — standalone terminal controller (`cargo run --bin gears-ctl`); live run and schedule monitoring with keyboard-driven cancel/pause/resume/delete; auto-refreshes every 2 seconds; configurable `--url` and `--interval`
@@ -1239,22 +1344,24 @@ There is no `ctx.start_child_workflow()` or `ctx.signal_workflow()`. Parent/chil
 ### Replay re-executes the full workflow function from the top
 On recovery, the workflow function runs from the beginning, fast-forwarding through history by returning cached results. For very long workflows with large histories, this replay can be slow. Snapshot/checkpoint support (saving the workflow's intermediate state) would mitigate this.
 
-### No distributed execution
-All workflow workers run as Tokio tasks within the same OS process as the engine. There is no mechanism to distribute work across separate machines, containers, or processes — all activity execution happens in-process via direct Rust function calls, not over a network protocol. This means:
+### Workflow execution is not distributed
+Workflows (the orchestration logic) run as Tokio tasks within the single engine process — there is no mechanism to shard or distribute workflow execution across multiple machines. The engine holds all in-flight workflow state in its process.
 
-- You cannot run a pool of worker processes that pull tasks from a shared queue (as Temporal workers do).
-- Horizontal scaling (adding more machines) does not spread workflow load — only the single process holding the engine executes workflows.
-- Vertical scaling (adding CPU cores) does help within the concurrency limit set on `WorkflowEngineBuilder`, since workers are async tasks sharing the Tokio thread pool.
+**Activities can run out-of-process via external workers.** Register an activity as external with `register_external_activity` and run any number of worker processes that poll the `/api/workers/poll` endpoint. Workers can be on different machines, in different containers, or written in different languages. The engine serializes tasks to SQLite so they survive restarts.
 
-Scaling out across multiple processes or hosts would require adding a distributed task-queue layer (e.g., having workers poll a shared database or message broker for work) and is out of scope for gears's current design.
+What is still single-process:
+- Workflow scheduling, replay, and dispatch
+- The SQLite storage layer (single connection, no replication)
+- Horizontal scaling of the engine itself (multiple engine instances are not coordinated)
 
 ## Future improvements
 
 - **Child workflows** — `ctx.start_child_workflow()` with parent/child linking and cancellation propagation
 - **Signals and queries** — external events that can be sent into a running workflow; read-only queries against workflow state
-- **Heartbeating** — long-running activities report liveness; engine can detect and restart stalled ones
 - **Connection pool** — replace the single SQLite connection with a pool for higher write throughput
 - **Alternative storage backends** — PostgreSQL, Redis, or a distributed key-value store
 - **Overlap policy** — configurable overlap policy (e.g. skip if already running, queue, or allow parallel) per schedule
 - **Determinism checker** — a test-mode that re-executes workflows twice and panics on divergence, to catch non-determinism bugs early (partial mitigation: `ctx.is_replaying()` and `ctx.workflow_start_time()` are available for safe workflow authoring)
 - **Snapshots / checkpoints** — persist intermediate workflow state to bound replay time for long-running workflows
+- **External worker gRPC transport** — typed protobuf-based alternative to the HTTP/JSON polling protocol for lower latency and stronger typing
+- **Schedule-to-start timeout enforcement** — configurable per-external-activity deadline before a task is treated as failed if not claimed by any worker

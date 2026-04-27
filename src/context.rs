@@ -13,10 +13,11 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::engine::{ExternalActivityConfig, ExternalTaskQueue};
 use crate::error::{Result, GearsError};
 use crate::event::{EventPayload, WorkflowEvent};
 use crate::metrics;
-use crate::traits::{Activity, Storage};
+use crate::traits::{Activity, PendingTask, Storage, TaskResult};
 
 use std::collections::HashMap;
 
@@ -134,6 +135,11 @@ struct ContextInner {
     event_seq: AtomicU64,
     storage: Arc<dyn Storage>,
     activities: Arc<HashMap<String, Arc<dyn Activity>>>,
+    external_activity_configs: Arc<HashMap<String, ExternalActivityConfig>>,
+    task_queue: Arc<ExternalTaskQueue>,
+    /// task_token → oneshot sender to unblock a waiting `execute_external_activity` call.
+    pending_completions:
+        Arc<tokio::sync::Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<TaskResult>>>>,
     /// Cancellation flag.
     cancelled: AtomicBool,
     /// Notified when the workflow is cancelled.
@@ -155,6 +161,11 @@ impl WorkflowContext {
         history: Vec<WorkflowEvent>,
         storage: Arc<dyn Storage>,
         activities: Arc<HashMap<String, Arc<dyn Activity>>>,
+        external_activity_configs: Arc<HashMap<String, ExternalActivityConfig>>,
+        task_queue: Arc<ExternalTaskQueue>,
+        pending_completions: Arc<
+            tokio::sync::Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<TaskResult>>>,
+        >,
     ) -> Self {
         // Find the max sequence already in history so we assign new
         // event sequences after all existing ones.
@@ -195,6 +206,9 @@ impl WorkflowContext {
                 event_seq: AtomicU64::new(max_seq + 1),
                 storage,
                 activities,
+                external_activity_configs,
+                task_queue,
+                pending_completions,
                 cancelled: AtomicBool::new(false),
                 cancel_notify: tokio::sync::Notify::new(),
                 shared_state: Mutex::new(None),
@@ -559,6 +573,12 @@ impl WorkflowContext {
     pub async fn execute_activity(&self, activity_name: &str, input: Value) -> Result<Value> {
         let sequence_id = self.next_sequence_id()?;
 
+        if self.inner.external_activity_configs.contains_key(activity_name) {
+            return self
+                .execute_external_activity(activity_name, input, sequence_id)
+                .await;
+        }
+
         let activity = self
             .inner
             .activities
@@ -568,6 +588,271 @@ impl WorkflowContext {
 
         self.execute_activity_inner(&*activity, input, sequence_id)
             .await
+    }
+
+    /// Execute an activity whose implementation lives in an external worker
+    /// process. Creates a `PendingTask` in storage, notifies waiting pollers,
+    /// and blocks until the worker reports a result (or the run is cancelled).
+    async fn execute_external_activity(
+        &self,
+        activity_name: &str,
+        input: Value,
+        sequence_id: u32,
+    ) -> Result<Value> {
+        self.check_cancelled()?;
+
+        // ── Replay path ───────────────────────────────────────────────────
+        for event in &self.inner.history {
+            if let EventPayload::ActivityCompleted {
+                sequence_id: sid,
+                output,
+            } = &event.payload
+                && *sid == sequence_id
+            {
+                return Ok(output.clone());
+            }
+            if let EventPayload::ActivityErrored {
+                sequence_id: sid,
+                error,
+            } = &event.payload
+                && *sid == sequence_id
+            {
+                return Err(GearsError::ActivityFailed(error.clone()));
+            }
+        }
+
+        // ── Live path ─────────────────────────────────────────────────────
+        let config = self
+            .inner
+            .external_activity_configs
+            .get(activity_name)
+            .expect("config must exist — checked in execute_activity");
+
+        // Count prior attempts from history to know which attempt number we are on.
+        let prior_attempts = self
+            .inner
+            .history
+            .iter()
+            .filter(|e| {
+                matches!(&e.payload,
+                    EventPayload::ActivityAttemptFailed { sequence_id: sid, .. }
+                    if *sid == sequence_id)
+            })
+            .count() as u32;
+
+        // Write ActivityScheduled only if not already in history.
+        let already_scheduled = self.inner.history.iter().any(|e| {
+            matches!(&e.payload,
+                EventPayload::ActivityScheduled { sequence_id: sid, .. }
+                if *sid == sequence_id)
+        });
+        if !already_scheduled {
+            self.append_event(EventPayload::ActivityScheduled {
+                sequence_id,
+                activity_name: activity_name.to_string(),
+                input: input.clone(),
+            })
+            .await?;
+        }
+
+        let max_attempts = config.max_attempts;
+        let base_delay = config.retry_base_delay;
+        let mut last_error = String::new();
+
+        for current_attempt in (prior_attempts + 1)..=max_attempts {
+            // Find an existing pending/claimed task for this (run, sequence, attempt)
+            // — crash recovery path — or create a fresh one.
+            let existing = self
+                .inner
+                .storage
+                .list_pending_tasks_by_run(self.run_id)
+                .await?
+                .into_iter()
+                .find(|t| {
+                    t.sequence_id == sequence_id
+                        && t.attempt == current_attempt
+                        && (t.status == "pending" || t.status == "claimed")
+                });
+
+            let (task_token, is_new_task) = if let Some(existing_task) = existing {
+                (existing_task.task_token, false)
+            } else {
+                let token = Uuid::new_v4();
+                let now = Utc::now();
+                let task = PendingTask {
+                    task_token: token,
+                    run_id: self.run_id,
+                    sequence_id,
+                    activity_name: activity_name.to_string(),
+                    input: input.clone(),
+                    attempt: current_attempt,
+                    status: "pending".to_string(),
+                    worker_id: None,
+                    heartbeat_at: None,
+                    schedule_to_start_timeout_ms: config
+                        .schedule_to_start_timeout
+                        .map(|d| d.as_millis() as u64),
+                    output: None,
+                    error_message: None,
+                    created_at: now,
+                    updated_at: now,
+                };
+                self.inner.storage.create_pending_task(task).await?;
+                (token, true)
+            };
+
+            // Register the oneshot sender BEFORE notifying workers to avoid the
+            // race where a worker completes the task before we can receive it.
+            let (tx, rx) = tokio::sync::oneshot::channel::<TaskResult>();
+            self.inner
+                .pending_completions
+                .lock()
+                .await
+                .insert(task_token, tx);
+
+            if is_new_task {
+                self.inner.task_queue.notify.notify_waiters();
+                self.append_event(EventPayload::ActivityDispatched {
+                    sequence_id,
+                    task_token,
+                    attempt: current_attempt,
+                })
+                .await?;
+            }
+
+            // Check storage immediately: handle the race where the worker already
+            // completed the task before we registered the sender above.
+            if let Some(t) = self.inner.storage.get_pending_task(task_token).await?
+                && (t.status == "completed" || t.status == "failed")
+            {
+                {
+                    self.inner
+                        .pending_completions
+                        .lock()
+                        .await
+                        .remove(&task_token);
+                    let task_result = task_result_from_status(&t);
+                    match task_result {
+                        TaskResult::Success { output } => {
+                            self.append_event(EventPayload::ActivityCompleted {
+                                sequence_id,
+                                output: output.clone(),
+                            })
+                            .await?;
+                            return Ok(output);
+                        }
+                        TaskResult::Failure { error } => {
+                            last_error = error.clone();
+                            self.append_event(EventPayload::ActivityAttemptFailed {
+                                sequence_id,
+                                attempt: current_attempt,
+                                error: last_error.clone(),
+                            })
+                            .await?;
+                            if current_attempt < max_attempts {
+                                tokio::time::sleep(
+                                    base_delay * 2u32.pow(current_attempt - 1),
+                                )
+                                .await;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+            // (end of immediate storage check)
+
+            // Wait for completion: oneshot channel (fast path) or periodic
+            // storage poll (crash-recovery fallback when the sender was dropped).
+            let result = self.wait_for_task(task_token, rx).await?;
+
+            self.inner
+                .pending_completions
+                .lock()
+                .await
+                .remove(&task_token);
+
+            match result {
+                TaskResult::Success { output } => {
+                    self.append_event(EventPayload::ActivityCompleted {
+                        sequence_id,
+                        output: output.clone(),
+                    })
+                    .await?;
+                    return Ok(output);
+                }
+                TaskResult::Failure { error } => {
+                    last_error = error.clone();
+                    self.append_event(EventPayload::ActivityAttemptFailed {
+                        sequence_id,
+                        attempt: current_attempt,
+                        error: last_error.clone(),
+                    })
+                    .await?;
+                    if current_attempt < max_attempts {
+                        tokio::time::sleep(base_delay * 2u32.pow(current_attempt - 1)).await;
+                    }
+                }
+            }
+        }
+
+        // All retries exhausted.
+        self.append_event(EventPayload::ActivityErrored {
+            sequence_id,
+            error: last_error.clone(),
+        })
+        .await?;
+        Err(GearsError::ActivityFailed(last_error))
+    }
+
+    /// Block until an external task completes. Uses the oneshot channel as the
+    /// fast path and polls storage every 5 seconds as the fallback (crash recovery).
+    async fn wait_for_task(
+        &self,
+        task_token: Uuid,
+        mut rx: tokio::sync::oneshot::Receiver<TaskResult>,
+    ) -> Result<TaskResult> {
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.inner.cancel_notify.notified() => {
+                    return Err(GearsError::Cancelled);
+                }
+                res = &mut rx => {
+                    match res {
+                        Ok(task_result) => return Ok(task_result),
+                        Err(_) => {
+                            // Sender dropped (engine restart): fall through to storage poll.
+                        }
+                    }
+                    // Poll storage once; if already done, return immediately.
+                    if let Some(t) = self.inner.storage.get_pending_task(task_token).await?
+                        && (t.status == "completed" || t.status == "failed")
+                    {
+                        return Ok(task_result_from_status(&t));
+                    }
+                    // rx is already consumed; keep polling storage.
+                    loop {
+                        self.check_cancelled()?;
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        if let Some(t) = self.inner.storage.get_pending_task(task_token).await?
+                            && (t.status == "completed" || t.status == "failed")
+                        {
+                            return Ok(task_result_from_status(&t));
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                    // Periodic poll: handles the case where the oneshot fires
+                    // and the select re-enters before the rx branch runs.
+                    if let Some(t) = self.inner.storage.get_pending_task(task_token).await?
+                        && (t.status == "completed" || t.status == "failed")
+                    {
+                        return Ok(task_result_from_status(&t));
+                    }
+                }
+            }
+        }
     }
 
     /// Core activity execution logic with an explicit sequence_id.
@@ -1354,5 +1639,20 @@ impl WorkflowContext {
             payload,
         };
         self.inner.storage.append_event(self.run_id, &event).await
+    }
+}
+
+fn task_result_from_status(task: &crate::traits::PendingTask) -> TaskResult {
+    if task.status == "completed" {
+        TaskResult::Success {
+            output: task.output.clone().unwrap_or(serde_json::Value::Null),
+        }
+    } else {
+        TaskResult::Failure {
+            error: task
+                .error_message
+                .clone()
+                .unwrap_or_else(|| format!("task {} failed", task.task_token)),
+        }
     }
 }

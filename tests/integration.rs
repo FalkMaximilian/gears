@@ -7,10 +7,10 @@ use uuid::Uuid;
 use std::sync::Arc;
 
 use gears::{
-    Activity, ActivityContext, ActivityFuture, CleanupPolicy, EventPayload, RetentionPolicy,
-    RunFilter, RunStatus, SqliteStorage, Storage, TypedActivity, TypedActivityFuture, TypedWorkflow,
-    TypedWorkflowFuture, Workflow, WorkflowContext, WorkflowEngine, WorkflowEvent, WorkflowFuture,
-    GearsError, branch,
+    Activity, ActivityContext, ActivityFuture, CleanupPolicy, EventPayload, ExternalActivityConfig,
+    RetentionPolicy, RunFilter, RunStatus, SqliteStorage, Storage, TypedActivity,
+    TypedActivityFuture, TypedWorkflow, TypedWorkflowFuture, Workflow, WorkflowContext,
+    WorkflowEngine, WorkflowEvent, WorkflowFuture, GearsError, branch,
 };
 
 // ── Test activities ──────────────────────────────────────────────────────
@@ -1951,5 +1951,225 @@ async fn retention_does_not_prune_running_workflows() {
 
     engine.cancel_workflow(run_id).await.unwrap();
     wait_for_status(&engine, run_id, RunStatus::Cancelled).await;
+    handle.shutdown().await;
+}
+
+// ── External worker tests ─────────────────────────────────────────────────
+
+struct ExternalWorkflow;
+
+impl ExternalWorkflow {
+    pub const NAME: &'static str = "external_wf";
+    pub const ACTIVITY: &'static str = "ext-echo";
+}
+
+impl Workflow for ExternalWorkflow {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn run(&self, ctx: WorkflowContext, input: Value) -> WorkflowFuture {
+        Box::pin(async move {
+            ctx.execute_activity(ExternalWorkflow::ACTIVITY, input).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_external_activity_round_trip() {
+    let storage = SqliteStorage::open(":memory:").await.unwrap();
+    let mut engine = WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(ExternalWorkflow)
+        .register_external_activity(
+            ExternalWorkflow::ACTIVITY,
+            ExternalActivityConfig {
+                heartbeat_timeout: Duration::from_secs(30),
+                max_attempts: 3,
+                ..Default::default()
+            },
+        )
+        .build()
+        .await
+        .unwrap();
+    let handle = engine.run().await.unwrap();
+
+    let run_id = engine
+        .start_workflow(ExternalWorkflow::NAME, json!({"msg": "hello"}))
+        .await
+        .unwrap();
+
+    // Give the context time to create the PendingTask.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Simulate a worker polling.
+    let task = engine
+        .poll_task(
+            vec![ExternalWorkflow::ACTIVITY.to_string()],
+            "test-worker-1".to_string(),
+            5_000,
+        )
+        .await
+        .unwrap()
+        .expect("should have a pending task");
+
+    assert_eq!(task.activity_name, ExternalWorkflow::ACTIVITY);
+    assert_eq!(task.input, json!({"msg": "hello"}));
+    assert_eq!(task.attempt, 1);
+    assert_eq!(task.status, "claimed");
+
+    // Worker completes the task.
+    engine
+        .complete_task(task.task_token, json!({"echoed": true}))
+        .await
+        .unwrap();
+
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+
+    let result = engine.get_run_result(run_id).await.unwrap().unwrap();
+    assert_eq!(result, json!({"echoed": true}));
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_external_activity_failure_and_retry() {
+    let storage = SqliteStorage::open(":memory:").await.unwrap();
+    let mut engine = WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(ExternalWorkflow)
+        .register_external_activity(
+            ExternalWorkflow::ACTIVITY,
+            ExternalActivityConfig {
+                heartbeat_timeout: Duration::from_secs(30),
+                max_attempts: 2,
+                retry_base_delay: Duration::from_millis(10),
+                ..Default::default()
+            },
+        )
+        .build()
+        .await
+        .unwrap();
+    let handle = engine.run().await.unwrap();
+
+    let run_id = engine
+        .start_workflow(ExternalWorkflow::NAME, json!({}))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // First attempt — worker fails it.
+    let task1 = engine
+        .poll_task(
+            vec![ExternalWorkflow::ACTIVITY.to_string()],
+            "worker-a".to_string(),
+            5_000,
+        )
+        .await
+        .unwrap()
+        .expect("attempt 1");
+    assert_eq!(task1.attempt, 1);
+    engine
+        .fail_task(task1.task_token, "transient error".to_string())
+        .await
+        .unwrap();
+
+    // Wait for backoff + new task to be created.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Second attempt — worker succeeds.
+    let task2 = engine
+        .poll_task(
+            vec![ExternalWorkflow::ACTIVITY.to_string()],
+            "worker-b".to_string(),
+            5_000,
+        )
+        .await
+        .unwrap()
+        .expect("attempt 2");
+    assert_eq!(task2.attempt, 2);
+    engine
+        .complete_task(task2.task_token, json!({"ok": true}))
+        .await
+        .unwrap();
+
+    wait_for_status(&engine, run_id, RunStatus::Completed).await;
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_external_activity_all_retries_exhausted() {
+    let storage = SqliteStorage::open(":memory:").await.unwrap();
+    let mut engine = WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(ExternalWorkflow)
+        .register_external_activity(
+            ExternalWorkflow::ACTIVITY,
+            ExternalActivityConfig {
+                heartbeat_timeout: Duration::from_secs(30),
+                max_attempts: 1,
+                ..Default::default()
+            },
+        )
+        .build()
+        .await
+        .unwrap();
+    let handle = engine.run().await.unwrap();
+
+    let run_id = engine
+        .start_workflow(ExternalWorkflow::NAME, json!({}))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let task = engine
+        .poll_task(
+            vec![ExternalWorkflow::ACTIVITY.to_string()],
+            "worker".to_string(),
+            5_000,
+        )
+        .await
+        .unwrap()
+        .expect("task");
+    engine
+        .fail_task(task.task_token, "permanent failure".to_string())
+        .await
+        .unwrap();
+
+    wait_for_status(&engine, run_id, RunStatus::Failed).await;
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_external_task_already_resolved_is_conflict() {
+    let storage = SqliteStorage::open(":memory:").await.unwrap();
+    let mut engine = WorkflowEngine::builder()
+        .with_storage(storage)
+        .register_workflow(ExternalWorkflow)
+        .register_external_activity(
+            ExternalWorkflow::ACTIVITY,
+            ExternalActivityConfig::default(),
+        )
+        .build()
+        .await
+        .unwrap();
+    let handle = engine.run().await.unwrap();
+
+    engine.start_workflow(ExternalWorkflow::NAME, json!({})).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let task = engine
+        .poll_task(vec![ExternalWorkflow::ACTIVITY.to_string()], "w".to_string(), 5_000)
+        .await
+        .unwrap()
+        .expect("task");
+    let token = task.task_token;
+
+    engine.complete_task(token, json!({})).await.unwrap();
+
+    // Second complete should be TaskAlreadyResolved.
+    let result = engine.complete_task(token, json!({})).await;
+    assert!(matches!(result, Err(gears::GearsError::TaskAlreadyResolved(_))));
     handle.shutdown().await;
 }

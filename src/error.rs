@@ -3,6 +3,7 @@ use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum GearsError {
     #[error("storage error: {0}")]
@@ -64,6 +65,18 @@ pub enum GearsError {
     /// A concurrent branch exhausted its pre-allocated sequence-ID budget.
     #[error("concurrent branch exceeded its sequence-id budget of {budget}")]
     BranchBudgetExceeded { budget: u32 },
+
+    /// `GET/POST /workers/tasks/{token}` — no pending task with this token.
+    #[error("no pending task with token {0}")]
+    TaskNotFound(Uuid),
+
+    /// `POST /workers/tasks/{token}/complete|fail` — task already resolved.
+    #[error("task {0} is already resolved")]
+    TaskAlreadyResolved(Uuid),
+
+    /// Heartbeat sent for a task not in `claimed` status.
+    #[error("heartbeat mismatch: task {0} is not in claimed status")]
+    HeartbeatMismatch(Uuid),
 
     #[error("{0}")]
     Other(String),

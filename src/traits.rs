@@ -76,6 +76,45 @@ pub trait Activity: Send + Sync + 'static {
     }
 }
 
+// ── External worker task types ────────────────────────────────────────────
+
+/// A task pending execution by an external worker.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct PendingTask {
+    pub task_token: Uuid,
+    pub run_id: Uuid,
+    pub sequence_id: u32,
+    pub activity_name: String,
+    #[schema(value_type = Object)]
+    pub input: serde_json::Value,
+    pub attempt: u32,
+    /// `"pending"` | `"claimed"` | `"completed"` | `"failed"`
+    pub status: String,
+    pub worker_id: Option<String>,
+    pub heartbeat_at: Option<DateTime<Utc>>,
+    pub schedule_to_start_timeout_ms: Option<u64>,
+    /// Set when status is `"completed"`. Contains the worker's output.
+    #[schema(value_type = Object)]
+    pub output: Option<serde_json::Value>,
+    /// Set when status is `"failed"`. Contains the error message.
+    pub error_message: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// The outcome reported back by an external worker.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TaskResult {
+    Success {
+        #[schema(value_type = Object)]
+        output: serde_json::Value,
+    },
+    Failure {
+        error: String,
+    },
+}
+
 // ── Storage ───────────────────────────────────────────────────────────────
 
 /// A record returned by `list_running_workflows` used for crash recovery.
@@ -210,4 +249,41 @@ pub trait Storage: Send + Sync + 'static {
 
     /// Record that a schedule fired at `fired_at` (updates `last_fired_at`).
     fn record_schedule_fired(&self, name: &str, fired_at: DateTime<Utc>) -> StorageFuture<()>;
+
+    // ── External worker task queue ────────────────────────────────────────
+
+    /// Insert a new pending task record.
+    fn create_pending_task(&self, task: PendingTask) -> StorageFuture<()>;
+
+    /// Atomically claim the oldest pending task matching any of the given
+    /// activity names for `worker_id`. Returns `None` if no matching task is
+    /// available.
+    fn claim_pending_task(
+        &self,
+        activity_names: &[String],
+        worker_id: &str,
+    ) -> StorageFuture<Option<PendingTask>>;
+
+    /// Mark a task as completed or failed. Returns
+    /// `GearsError::TaskAlreadyResolved` if it is already in a terminal state,
+    /// or `GearsError::TaskNotFound` if the token does not exist.
+    fn resolve_pending_task(&self, task_token: Uuid, result: TaskResult) -> StorageFuture<()>;
+
+    /// Update `heartbeat_at` for a claimed task. Returns `false` if the task
+    /// is not in `claimed` status (wrong status or not found).
+    fn heartbeat_pending_task(&self, task_token: Uuid) -> StorageFuture<bool>;
+
+    /// Fetch a single pending task by token. Returns `None` if not found.
+    fn get_pending_task(&self, task_token: Uuid) -> StorageFuture<Option<PendingTask>>;
+
+    /// List all non-terminal pending tasks for a given run (used for crash
+    /// recovery to find tasks that need to be re-queued or resumed).
+    fn list_pending_tasks_by_run(&self, run_id: Uuid) -> StorageFuture<Vec<PendingTask>>;
+
+    /// Find claimed tasks whose `heartbeat_at` is older than `older_than_ms`
+    /// milliseconds ago (stale workers).
+    fn list_stale_pending_tasks(&self, older_than_ms: u64) -> StorageFuture<Vec<PendingTask>>;
+
+    /// Reset a claimed task back to `pending` so another worker can claim it.
+    fn reset_pending_task(&self, task_token: Uuid) -> StorageFuture<()>;
 }

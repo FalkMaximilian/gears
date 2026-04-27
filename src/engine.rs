@@ -15,7 +15,8 @@ use crate::error::{Result, GearsError};
 use crate::metrics;
 use crate::event::WorkflowEvent;
 use crate::traits::{
-    Activity, RunFilter, RunInfo, RunStatus, ScheduleRecord, ScheduleStatus, Storage, Workflow,
+    Activity, PendingTask, RunFilter, RunInfo, RunStatus, ScheduleRecord, ScheduleStatus,
+    Storage, TaskResult, Workflow,
 };
 use crate::worker::{CleanupPolicy, WorkerTask};
 
@@ -76,6 +77,54 @@ impl RetentionPolicy {
     }
 }
 
+// ── External worker support ───────────────────────────────────────────────
+
+/// Configuration for an activity type handled by external workers.
+///
+/// Register via [`WorkflowEngineBuilder::register_external_activity`].
+#[derive(Debug, Clone)]
+pub struct ExternalActivityConfig {
+    /// Workers must send a heartbeat within this window or the task is
+    /// reset to `pending` and re-queued for another worker.
+    pub heartbeat_timeout: Duration,
+    /// If set, a task that is not claimed within this window is treated
+    /// as a failed attempt.
+    pub schedule_to_start_timeout: Option<Duration>,
+    /// Maximum number of attempts before the workflow receives an error.
+    /// Defaults to 3.
+    pub max_attempts: u32,
+    /// Base retry delay (doubles on each attempt). Defaults to 1 second.
+    pub retry_base_delay: Duration,
+}
+
+impl Default for ExternalActivityConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_timeout: Duration::from_secs(30),
+            schedule_to_start_timeout: None,
+            max_attempts: 3,
+            retry_base_delay: Duration::from_secs(1),
+        }
+    }
+}
+
+/// In-memory notification layer for the external task queue.
+///
+/// A single shared [`tokio::sync::Notify`] wakes all long-polling workers
+/// whenever any new pending task is created. Workers filter by activity name
+/// on the actual claim attempt (second pass after the Notify fires).
+pub struct ExternalTaskQueue {
+    pub notify: Arc<tokio::sync::Notify>,
+}
+
+impl ExternalTaskQueue {
+    fn new() -> Self {
+        Self {
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
 // ── Internal message types ────────────────────────────────────────────────
 
 struct StartRequest {
@@ -93,6 +142,7 @@ pub struct WorkflowEngineBuilder {
     storage: Option<Arc<dyn Storage>>,
     workflows: HashMap<String, Arc<dyn Workflow>>,
     activities: HashMap<String, Arc<dyn Activity>>,
+    external_activities: HashMap<String, ExternalActivityConfig>,
     max_concurrent: usize,
     cleanup_policy: CleanupPolicy,
     retention_policy: RetentionPolicy,
@@ -104,6 +154,7 @@ impl Default for WorkflowEngineBuilder {
             storage: None,
             workflows: HashMap::new(),
             activities: HashMap::new(),
+            external_activities: HashMap::new(),
             max_concurrent: 100,
             cleanup_policy: CleanupPolicy::default(),
             retention_policy: RetentionPolicy::default(),
@@ -128,6 +179,17 @@ impl WorkflowEngineBuilder {
 
     pub fn register_activity(mut self, a: impl Activity) -> Self {
         self.activities.insert(a.name().to_string(), Arc::new(a));
+        self
+    }
+
+    /// Register an activity type whose execution is delegated to external
+    /// workers that poll the engine via the `/api/workers/poll` endpoint.
+    pub fn register_external_activity(
+        mut self,
+        name: &str,
+        config: ExternalActivityConfig,
+    ) -> Self {
+        self.external_activities.insert(name.to_string(), config);
         self
     }
 
@@ -166,10 +228,14 @@ impl WorkflowEngineBuilder {
                 GearsError::Other(format!("scheduler init failed: {e}"))
             })?));
 
+        let task_queue = Arc::new(ExternalTaskQueue::new());
+        let pending_completions = Arc::new(Mutex::new(HashMap::new()));
+
         Ok(WorkflowEngine {
             storage,
             workflows: Arc::new(self.workflows),
             activities: Arc::new(self.activities),
+            external_activity_configs: Arc::new(self.external_activities),
             start_tx,
             start_rx: Some(start_rx),
             max_concurrent: self.max_concurrent,
@@ -178,6 +244,8 @@ impl WorkflowEngineBuilder {
             job_handles: Arc::new(Mutex::new(HashMap::new())),
             cleanup_policy: self.cleanup_policy,
             retention_policy: self.retention_policy,
+            task_queue,
+            pending_completions,
         })
     }
 }
@@ -188,6 +256,7 @@ pub struct WorkflowEngine {
     storage: Arc<dyn Storage>,
     workflows: Arc<HashMap<String, Arc<dyn Workflow>>>,
     activities: Arc<HashMap<String, Arc<dyn Activity>>>,
+    external_activity_configs: Arc<HashMap<String, ExternalActivityConfig>>,
     start_tx: mpsc::Sender<StartRequest>,
     /// Held until `run()` is called and moves it into the dispatch task.
     start_rx: Option<mpsc::Receiver<StartRequest>>,
@@ -198,6 +267,10 @@ pub struct WorkflowEngine {
     job_handles: Arc<Mutex<HashMap<String, Uuid>>>,
     cleanup_policy: CleanupPolicy,
     retention_policy: RetentionPolicy,
+    pub(crate) task_queue: Arc<ExternalTaskQueue>,
+    /// task_token → oneshot sender to unblock a waiting workflow context.
+    pub(crate) pending_completions:
+        Arc<Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<TaskResult>>>>,
 }
 
 impl WorkflowEngine {
@@ -212,6 +285,20 @@ impl WorkflowEngine {
         let running: Vec<crate::traits::RunRecord> = self.storage.list_running_workflows().await?;
         if !running.is_empty() {
             tracing::info!("recovering {} in-flight workflow(s)", running.len());
+        }
+        for record in &running {
+            // Reset any claimed external tasks — the worker that held them is
+            // gone. Pending tasks are fine as-is; workers will re-poll them.
+            let tasks = self.storage.list_pending_tasks_by_run(record.run_id).await?;
+            for task in tasks {
+                if task.status == "claimed" {
+                    let _ = self.storage.reset_pending_task(task.task_token).await;
+                }
+            }
+        }
+        // Wake any workers that may already be long-polling.
+        if !running.is_empty() && !self.external_activity_configs.is_empty() {
+            self.task_queue.notify.notify_waiters();
         }
         for record in running {
             self.start_tx
@@ -234,9 +321,12 @@ impl WorkflowEngine {
         let storage = self.storage.clone();
         let workflows = self.workflows.clone();
         let activities = self.activities.clone();
+        let external_activity_configs = self.external_activity_configs.clone();
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent));
         let cancel_handles = self.cancel_handles.clone();
         let cleanup_policy = self.cleanup_policy;
+        let task_queue = self.task_queue.clone();
+        let pending_completions = self.pending_completions.clone();
 
         tokio::spawn(dispatch_loop(
             start_rx,
@@ -244,9 +334,12 @@ impl WorkflowEngine {
             storage,
             workflows,
             activities,
+            external_activity_configs,
             semaphore,
             cancel_handles,
             cleanup_policy,
+            task_queue,
+            pending_completions,
         ));
 
         // Re-register all active schedules persisted from previous runs.
@@ -299,9 +392,24 @@ impl WorkflowEngine {
             None
         };
 
+        let stale_monitor_shutdown_tx = if !self.external_activity_configs.is_empty() {
+            let (stale_tx, stale_rx) = oneshot::channel::<()>();
+            tokio::spawn(stale_task_monitor(
+                stale_rx,
+                self.storage.clone(),
+                self.task_queue.clone(),
+                self.external_activity_configs.clone(),
+            ));
+            tracing::info!("external task stale monitor started");
+            Some(stale_tx)
+        } else {
+            None
+        };
+
         Ok(EngineHandle {
             shutdown_tx,
             pruner_shutdown_tx,
+            stale_monitor_shutdown_tx,
             job_scheduler: self.job_scheduler.clone(),
         })
     }
@@ -599,6 +707,96 @@ impl WorkflowEngine {
     pub async fn prune_now(&self) {
         run_pruning_pass(&self.storage, &self.workflows, &self.retention_policy).await;
     }
+
+    // ── External worker API ───────────────────────────────────────────────
+
+    /// Long-poll for a pending task matching any of the given activity names.
+    ///
+    /// Returns immediately if a task is available, otherwise waits up to
+    /// `timeout_ms` milliseconds. Returns `None` if the timeout expires with
+    /// no task available.
+    pub async fn poll_task(
+        &self,
+        activity_names: Vec<String>,
+        worker_id: String,
+        timeout_ms: u64,
+    ) -> Result<Option<PendingTask>> {
+        // First attempt: claim immediately if a task is already pending.
+        if let Some(task) = self
+            .storage
+            .claim_pending_task(&activity_names, &worker_id)
+            .await?
+        {
+            return Ok(Some(task));
+        }
+
+        // Long-poll: wait until a new task is signalled or timeout expires.
+        tokio::select! {
+            _ = self.task_queue.notify.notified() => {}
+            _ = tokio::time::sleep(Duration::from_millis(timeout_ms)) => {}
+        }
+
+        // Second attempt after wakeup.
+        self.storage
+            .claim_pending_task(&activity_names, &worker_id)
+            .await
+    }
+
+    /// Report that an external worker completed a task successfully.
+    pub async fn complete_task(&self, task_token: Uuid, output: Value) -> Result<()> {
+        self.storage
+            .resolve_pending_task(task_token, TaskResult::Success { output: output.clone() })
+            .await?;
+        // Fast path: wake the waiting workflow context via in-memory channel.
+        if let Some(tx) = self.pending_completions.lock().await.remove(&task_token) {
+            let _ = tx.send(TaskResult::Success { output });
+        }
+        Ok(())
+    }
+
+    /// Report that an external worker failed a task.
+    pub async fn fail_task(&self, task_token: Uuid, error: String) -> Result<()> {
+        self.storage
+            .resolve_pending_task(task_token, TaskResult::Failure { error: error.clone() })
+            .await?;
+        if let Some(tx) = self.pending_completions.lock().await.remove(&task_token) {
+            let _ = tx.send(TaskResult::Failure { error });
+        }
+        Ok(())
+    }
+
+    /// Send a heartbeat for a claimed task. Returns `true` if the run has
+    /// been cancelled (signal for the worker to stop).
+    pub async fn heartbeat_task(&self, task_token: Uuid) -> Result<bool> {
+        let updated = self.storage.heartbeat_pending_task(task_token).await?;
+        if !updated {
+            return Err(GearsError::HeartbeatMismatch(task_token));
+        }
+        // Check whether the owning run was cancelled.
+        let task = self
+            .storage
+            .get_pending_task(task_token)
+            .await?
+            .ok_or(GearsError::TaskNotFound(task_token))?;
+        let status = self.storage.get_run_status(task.run_id).await?;
+        Ok(status == RunStatus::Cancelled)
+    }
+
+    /// Fetch a pending task by token. Returns `GearsError::TaskNotFound` if
+    /// the token does not exist.
+    pub async fn get_pending_task(&self, task_token: Uuid) -> Result<PendingTask> {
+        self.storage
+            .get_pending_task(task_token)
+            .await?
+            .ok_or(GearsError::TaskNotFound(task_token))
+    }
+
+    /// Names of all registered external activity types.
+    pub fn external_activity_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.external_activity_configs.keys().cloned().collect();
+        names.sort();
+        names
+    }
 }
 
 // ── Dispatch loop ─────────────────────────────────────────────────────────
@@ -610,9 +808,12 @@ async fn dispatch_loop(
     storage: Arc<dyn Storage>,
     workflows: Arc<HashMap<String, Arc<dyn Workflow>>>,
     activities: Arc<HashMap<String, Arc<dyn Activity>>>,
+    external_activity_configs: Arc<HashMap<String, ExternalActivityConfig>>,
     semaphore: Arc<Semaphore>,
     cancel_handles: CancelHandles,
     cleanup_policy: CleanupPolicy,
+    task_queue: Arc<ExternalTaskQueue>,
+    pending_completions: Arc<Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<TaskResult>>>>,
 ) {
     loop {
         tokio::select! {
@@ -646,10 +847,13 @@ async fn dispatch_loop(
                     run_id: req.run_id,
                     workflow,
                     activities: activities.clone(),
+                    external_activity_configs: external_activity_configs.clone(),
                     storage: storage.clone(),
                     history,
                     input: req.input,
                     cleanup_policy,
+                    task_queue: task_queue.clone(),
+                    pending_completions: pending_completions.clone(),
                 };
 
                 let handles = cancel_handles.clone();
@@ -719,11 +923,59 @@ fn build_scheduler_job(
 
 // ── EngineHandle ──────────────────────────────────────────────────────────
 
+// ── Stale task monitor ────────────────────────────────────────────────────
+
+async fn stale_task_monitor(
+    mut shutdown_rx: oneshot::Receiver<()>,
+    storage: Arc<dyn Storage>,
+    task_queue: Arc<ExternalTaskQueue>,
+    configs: Arc<HashMap<String, ExternalActivityConfig>>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    interval.tick().await; // skip the immediate first tick
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let min_timeout_ms = configs
+                    .values()
+                    .map(|c| c.heartbeat_timeout.as_millis() as u64)
+                    .min()
+                    .unwrap_or(30_000);
+                match storage.list_stale_pending_tasks(min_timeout_ms).await {
+                    Ok(stale) => {
+                        for task in stale {
+                            if storage.reset_pending_task(task.task_token).await.is_ok() {
+                                tracing::warn!(
+                                    task_token = %task.task_token,
+                                    activity = %task.activity_name,
+                                    "stale external task reset to pending"
+                                );
+                                task_queue.notify.notify_waiters();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "stale task monitor query failed");
+                    }
+                }
+            }
+            _ = &mut shutdown_rx => {
+                tracing::info!("stale task monitor shutting down");
+                break;
+            }
+        }
+    }
+}
+
+// ── EngineHandle ──────────────────────────────────────────────────────────
+
 /// Returned by `WorkflowEngine::run()`. Drop it or call `shutdown()` to
 /// stop the dispatch loop and the cron scheduler.
 pub struct EngineHandle {
     shutdown_tx: oneshot::Sender<()>,
     pruner_shutdown_tx: Option<oneshot::Sender<()>>,
+    stale_monitor_shutdown_tx: Option<oneshot::Sender<()>>,
     job_scheduler: Arc<Mutex<JobScheduler>>,
 }
 
@@ -731,6 +983,9 @@ impl EngineHandle {
     pub async fn shutdown(self) {
         let _ = self.job_scheduler.lock().await.shutdown().await;
         if let Some(tx) = self.pruner_shutdown_tx {
+            let _ = tx.send(());
+        }
+        if let Some(tx) = self.stale_monitor_shutdown_tx {
             let _ = tx.send(());
         }
         let _ = self.shutdown_tx.send(());

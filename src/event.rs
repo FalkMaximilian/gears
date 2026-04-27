@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// One entry in the durable event log for a workflow run.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -11,6 +12,7 @@ pub struct WorkflowEvent {
 }
 
 /// All possible state transitions for a workflow run.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventPayload {
@@ -29,6 +31,15 @@ pub enum EventPayload {
         activity_name: String,
         #[schema(value_type = Object)]
         input: serde_json::Value,
+    },
+
+    /// An external worker claimed this task from the queue. Written for
+    /// observability only — replay correctness depends solely on
+    /// `ActivityCompleted` / `ActivityErrored`.
+    ActivityDispatched {
+        sequence_id: u32,
+        task_token: Uuid,
+        attempt: u32,
     },
 
     /// Activity completed successfully.
@@ -210,6 +221,11 @@ mod tests {
             sequence_id: 10,
             num_branches: 3,
             branch_budget: 1000,
+        });
+        round_trip(EventPayload::ActivityDispatched {
+            sequence_id: 0,
+            task_token: Uuid::new_v4(),
+            attempt: 1,
         });
     }
 }
